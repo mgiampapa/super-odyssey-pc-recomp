@@ -14,12 +14,15 @@
 #include "../../odyssey_pose.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
+#include "../../diagnostics.h"
 #include "../../updater.h"
 #include "dlss_probe.h"
+#include "xess_sdk.h"
 #include "shaders.h"
 #include "vk.h"
 #include "../interp.h"
 #include "../output_scale.h"
+#include "../../ui/performance.h"
 #include "../renderer.h"
 
 VkG g_vk;
@@ -45,6 +48,7 @@ static void create_instance(void) {
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
 #ifdef _WIN32
     vk_dlss_probe_instance(ext, &n_ext, SDL_arraysize(ext) - 1);
+    vk_xess_instance_extensions(ext, &n_ext, SDL_arraysize(ext) - 1);
 #endif
     bool validate = getenv("ODYSSEY_VK_VALIDATION") != NULL;
     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
@@ -103,6 +107,15 @@ static void pick_device(void) {
     g_vk.phys = pd[best];
     free(pd);
     vkGetPhysicalDeviceProperties(g_vk.phys, &g_vk.props);
+    VkPhysicalDeviceDriverProperties driver = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 description = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &driver};
+    vkGetPhysicalDeviceProperties2(g_vk.phys, &description);
+    char info[1024];
+    snprintf(info, sizeof info, "%s; %s; %s; driver version %#x; vendor %#x device %#x; Vulkan %u.%u.%u",
+             g_vk.props.deviceName, driver.driverName, driver.driverInfo, g_vk.props.driverVersion,
+             g_vk.props.vendorID, g_vk.props.deviceID, VK_API_VERSION_MAJOR(g_vk.props.apiVersion),
+             VK_API_VERSION_MINOR(g_vk.props.apiVersion), VK_API_VERSION_PATCH(g_vk.props.apiVersion));
+    diagnostics_gpu(info);
     uint32_t nq = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &nq, NULL);
     VkQueueFamilyProperties *qp = calloc(nq, sizeof *qp);
@@ -210,12 +223,15 @@ static void create_device(void) {
     LOG("[vk] pipeline binaries: %s\n", g_vk.pbin ? "on" : "off");
 #ifdef _WIN32
     vk_dlss_probe_device(ep, ne, ext, &n_ext, SDL_arraysize(ext));
+    vk_xess_device_extensions(ep, ne, ext, &n_ext, SDL_arraysize(ext));
 #endif
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
     VkPhysicalDeviceVulkan13Features have13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have13};
+    VkPhysicalDeviceVulkan12Features have12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &have13};
+    VkPhysicalDeviceVulkan11Features have11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &have12};
+    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have11};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
@@ -227,16 +243,22 @@ static void create_device(void) {
                                             .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
                                             .shaderDemoteToHelperInvocation = VK_TRUE, .shaderTerminateInvocation = VK_TRUE,
                                             .maintenance4 = VK_TRUE,
+                                            .shaderIntegerDotProduct = have13.shaderIntegerDotProduct,
+                                            .subgroupSizeControl = have13.subgroupSizeControl,
+                                            .computeFullSubgroups = have13.computeFullSubgroups,
                                             // texel fetches outside the image return 0 on the Switch; in Vulkan they are
                                             // undefined without this (Odyssey's dynamic resolution: device lost)
                                             .robustImageAccess = have13.robustImageAccess,
                                             .pipelineCreationCacheControl = have13.pipelineCreationCacheControl,
                                             .pNext = g_vk.custom_border ? (void *)&cbc : g_vk.divisor ? (void *)&div : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                            .shaderFloat16 = have12.shaderFloat16,
+                                            .shaderSubgroupExtendedTypes = have12.shaderSubgroupExtendedTypes,
                                             .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
                                             .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
                                             .scalarBlockLayout = VK_TRUE, .pNext = &f13};
     VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+                                            .uniformAndStorageBuffer16BitAccess = have11.uniformAndStorageBuffer16BitAccess,
                                             .storageBuffer16BitAccess = VK_TRUE, .pNext = &f12};
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
@@ -253,6 +275,7 @@ static void create_device(void) {
     g_vk.feat_aniso = h->samplerAnisotropy;
     b->textureCompressionBC = h->textureCompressionBC;
     b->shaderInt64 = h->shaderInt64;
+    b->shaderInt16 = h->shaderInt16;
     b->depthBiasClamp = h->depthBiasClamp;
     b->depthClamp = h->depthClamp;
     b->largePoints = h->largePoints;
@@ -264,9 +287,10 @@ static void create_device(void) {
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
     b->shaderClipDistance = h->shaderClipDistance;
     b->shaderStorageImageWriteWithoutFormat = h->shaderStorageImageWriteWithoutFormat;
+    b->shaderStorageImageReadWithoutFormat = h->shaderStorageImageReadWithoutFormat;
+    b->shaderStorageImageExtendedFormats = h->shaderStorageImageExtendedFormats;
 #ifdef _WIN32
-    if (g_settings.dlss_mode || getenv("ODYSSEY_DLSS"))
-        b->shaderStorageImageExtendedFormats = h->shaderStorageImageExtendedFormats;
+    vk_xess_enable_features(&f, &f11, &f12, &f13);
 #endif
     g_vk.storage_write_without_format = b->shaderStorageImageWriteWithoutFormat;
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
@@ -276,6 +300,9 @@ static void create_device(void) {
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+#ifdef _WIN32
+    vk_xess_device_created();
+#endif
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
@@ -945,9 +972,9 @@ static bool present_fast(TexBackend *w) {
             if (bgr) { uint8_t t = px[i * 4]; px[i * 4] = px[i * 4 + 2]; px[i * 4 + 2] = t; }
             px[i * 4 + 3] = 255;
         }
-        char path[64];
+        char path[1024];
         if (ws_n > 1) snprintf(path, sizeof path, "build/window_%02d.png", ws_i);
-        else snprintf(path, sizeof path, "build/window.png");
+        else snprintf(path, sizeof path, "%s", getenv("ODYSSEY_WINDOW_SHOT_PATH") ? getenv("ODYSSEY_WINDOW_SHOT_PATH") : "build/window.png");
         vk_save_png(path, px, e.width, e.height);
         vmaDestroyBuffer(g_vk.vma, sbuf, smem);
         if (++ws_i == ws_n && getenv("ODYSSEY_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
@@ -1193,7 +1220,7 @@ static bool frame_placement(float v[4], float pv[8]) {
     output_scale(dw, dh, odyssey_wide(), SDL_GetTicksNS() / 1e9, -1, &os);
 #ifdef _WIN32
     // Only the automatic choice lets a DLSS preset pick the input resolution.
-    double dlss_scale = vk_dlss_scale();
+    double dlss_scale = vk_temporal_scale();
     if (g_settings.res_mode == RES_MATCH && dlss_scale && os.shape == 1.0 && os.vh >= 720) {
         os.sx = os.vw * dlss_scale / GAME_W;
         os.sy = os.vh * dlss_scale / GAME_H;
@@ -1201,6 +1228,8 @@ static bool frame_placement(float v[4], float pv[8]) {
 #endif
     float crop[4] = {0, 0, 1, 1};  // uv origin and size: all of it
     renderer_set_scale((float)os.sx, (float)os.sy);
+    vk_overlay_resolution((unsigned)(GAME_W * os.sx + 0.5), (unsigned)(GAME_H * os.sy + 0.5), (unsigned)(os.vw + 0.5),
+                          (unsigned)(os.vh + 0.5));  // (the performance overlay's "1600 x 900 -> 3840 x 2160")
     v[0] = (float)os.vx, v[1] = (float)os.vy, v[2] = (float)os.vw, v[3] = (float)os.vh;
     pv[0] = renderer_origin_lower_left() ? 1.0f : 0.0f;
     memcpy(pv + 4, crop, sizeof crop);
@@ -1217,7 +1246,7 @@ static void frame_decide(NvnTexture *t, uint64_t present_at) {
     g_interp_present_frame = total_frames;
     int interp_want = odyssey_native_120_enabled() ? INTERP_OFF : interp_wanted();
 #ifdef _WIN32
-    if (vk_dlss_enabled()) interp_want = INTERP_OFF;
+    if (vk_temporal_enabled()) interp_want = INTERP_OFF;
 #endif
     if (interp_want == INTERP_ON && total_frames < brake_until) interp_want = INTERP_OFF;
     // (in-betweens need a display at 90 Hz or more - ODYSSEY_INTERP=on: any; below, not even the logging)
@@ -1361,9 +1390,10 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
             if (spec) sscanf(spec, "%ld:%ld", &win_shot, &shot_count);
         }
         bool shot = win_shot && (long)total_frames + 1 >= win_shot && shot_index < shot_count;
-        char shot_path[64];
+        char shot_path[1024];
         if (shot) {
-            if (shot_count == 1) snprintf(shot_path, sizeof shot_path, "build/window.png");
+            if (shot_count == 1) snprintf(shot_path, sizeof shot_path, "%s",
+                getenv("ODYSSEY_WINDOW_SHOT_PATH") ? getenv("ODYSSEY_WINDOW_SHOT_PATH") : "build/window.png");
             else snprintf(shot_path, sizeof shot_path, "build/window_%02ld.png", shot_index);
             shot_index++;
         }
@@ -1546,6 +1576,8 @@ void ui_window_init(void) {
     create_device();
 #ifdef _WIN32
     vk_dlss_probe_run();
+    extern void vk_fsr3_init(void);
+    vk_fsr3_init();
 #endif
     create_swapchain();
     vk_exec_init();

@@ -4,9 +4,11 @@
 #include <string.h>
 
 #include "../kernel.h"
+#include "../sampler.h"
 #include "interp.h"
 #include "rqueue.h"
 #include "nvn.h"
+#include "linear_texture.h"
 
 void renderer_sync(void);
 
@@ -28,7 +30,7 @@ static uint32_t device_integer(uint32_t which) {
         [40] = 1, [41] = 1, [42] = 1,  // min/max filtering, stencil8, ASTC
         [43] = 0x40000, [44] = 15, [45] = 2048,
         [46] = 1, [47] = 5, [48] = 1, [49] = 15,
-        [50] = 256, [51] = 1, [52] = 0, [53] = 0, [54] = 0, [55] = 256, [56] = 1, [57] = 0x1000,
+        [50] = 256, [51] = 1, [52] = 0, [53] = 0, [54] = 0, [55] = 256, [56] = 32, [57] = 128,
         [58] = 1, [59] = 1, [60] = 1, [61] = 1, [62] = 1, [63] = 1, [64] = 1,
     };
     // Odyssey 1.4.1 was built against a newer NVN and refuses one older than 53.311 (sead::GameFrameworkNx::
@@ -221,12 +223,150 @@ NVN(nvnMemoryPoolInitialize) {
 // (frame interpolation: a replay on its own thread must not run while a host object it may use goes - interp.c)
 NVN(nvnMemoryPoolFinalize) { rq_drain(); interp_free_begin(); free(HOST(NvnPool, A(0))); SET_HOST(A(0), 0); interp_free_end(); }
 NVN(nvnMemoryPoolSetDebugLabel) { (void)c; }
-NVN(nvnMemoryPoolMap) { RET(HOST(NvnPool, A(0))->storage); }
+// al::getF32FromLinearTextureF16, immediately after its indirect MemoryPoolMap
+// call. Both builds keep nc/comp/y/x/offset/row-elements in x19..x24.
+// Match the loaded main as well as LR: another game's caller must never cause
+// its registers to be interpreted as Odyssey's texture coordinates.
+static bool fog_f16_map_reader(uint64_t lr) {
+    if (lr == 0x70007ac640ull) return loader_main_is_v141();
+    if (lr != 0x7000a2b86cull) return false;
+    static const uint8_t v100[8] = {0x3c, 0xa1, 0x2d, 0xfa, 0xaf, 0x9c, 0x82, 0xda};
+    const Module *main = loader_module("main");
+    return main && !memcmp(main->build_id, v100, sizeof v100);
+}
+
+static void paint_sync_rows(uint64_t td, bool refresh, unsigned reader) {
+    if (td < GUEST_LO || td >= GUEST_HI - 0x50) return;
+    uint64_t pool = G(uint64_t, td, 0), off = G(uint32_t, td, 8);
+    if (!pool) return;
+    NvnPool *p = HOST(NvnPool, pool);
+    if (!p || off >= p->size) return;
+    uint64_t capacity = p->size - off;
+    if (capacity > 4 * 1024 * 1024) capacity = 4 * 1024 * 1024;
+    void *snapshot = malloc(capacity);
+    RqCpuTexel q = {.addr = p->storage + off, .components = 1, .component_bytes = 4,
+        .snapshot = snapshot, .snapshot_capacity = capacity, .guest_capacity = p->size - off,
+        .guest_pitch = G(uint32_t, td, 0x4c), .refresh_snapshot = refresh};
+#ifndef __APPLE__
+    if (snapshot) {
+        if (rq_enabled()) rq_wait(rq_push(RQ_CPU_TEXEL, &q, 0));
+        else { extern void renderer_cpu_texel(RqCpuTexel *); renderer_cpu_texel(&q); }
+    }
+#endif
+    bool stored = q.valid && nvn_linear_store_rows((void *)(uintptr_t)q.addr, q.guest_capacity, q.guest_pitch,
+        snapshot, capacity, (uint64_t)q.snapshot_width * 4, q.snapshot_height);
+    if (stored) p->paint_cpu_shared = true;
+    static unsigned counts[4];
+    static const char *names[] = {"attack", "label mask", "label color", "median"};
+    if (reader < 4 && ++counts[reader] <= 4) LOG("[paint-sync] %s input %llx %ux%u pitch %llu synchronized %d\n",
+        names[reader], (unsigned long long)q.addr, q.snapshot_width, q.snapshot_height, (unsigned long long)q.guest_pitch, stored);
+    free(snapshot);
+}
+NVN(nvnMemoryPoolMap) {
+    NvnPool *p = HOST(NvnPool, A(0));
+    // The 1.0.0 RGBA8 reader calculates its row index after Map. The paint mask
+    // is GPU-rendered; return only the requested, validated packed texel.
+    static int paint_feedback = -1;
+    if (paint_feedback < 0) {
+        const char *e = getenv("ODYSSEY_PAINT_CPU_READBACK");
+        paint_feedback = !e || atoi(e) != 0;
+    }
+    static int paint_trace = -1;
+    if (paint_trace < 0) paint_trace = getenv("ODYSSEY_LOG_PAINT_READS") != NULL;
+    // These PaintObj loops bypass getColorFromLinearTexture. attackSensor
+    // samples a whole player footprint, rather than a single coordinate.
+    uint64_t paint_lr = c->x[30];
+    if (paint_feedback && (paint_lr == 0x70002dc49cull || paint_lr == 0x70002da5e0ull || paint_lr == 0x70002d99a0ull)) {
+        static const uint8_t v100[8] = {0x3c, 0xa1, 0x2d, 0xfa, 0xaf, 0x9c, 0x82, 0xda};
+        const Module *main = loader_module("main");
+        if (main && !memcmp(main->build_id, v100, sizeof v100)) {
+            if (paint_lr == 0x70002dc49cull) paint_sync_rows(c->x[22], true, 3);
+            else if (paint_lr == 0x70002da5e0ull) paint_sync_rows(c->x[21], false, 0);
+            else if (c->x[26] >= GUEST_LO && c->x[26] < GUEST_HI - 0x79b0) {
+                // Prepare both buffers before labeling changes either on the CPU.
+                // Do not overwrite CPU edits at its inner per-pixel Map calls.
+                paint_sync_rows(G(uint64_t, c->x[26], 0x79a8), true, 1);
+                paint_sync_rows(G(uint64_t, c->x[26], 0x7968), true, 2);
+            }
+        }
+    }
+    if (c->x[30] == 0x7000a2b7ccull && (paint_trace || paint_feedback)) {
+        static const uint8_t v100[8] = {0x3c, 0xa1, 0x2d, 0xfa, 0xaf, 0x9c, 0x82, 0xda};
+        const Module *main = loader_module("main");
+        uint64_t td = c->x[21];
+        if (main && !memcmp(main->build_id, v100, sizeof v100) && td >= GUEST_LO && td < GUEST_HI - 0x50) {
+            uint32_t pitch = G(uint32_t, td, 0x4c), x = c->x[20], y = c->x[19];
+            uint64_t off = (uint32_t)c->x[22];
+            int64_t byte = (int64_t)off + (int64_t)(int32_t)((pitch >> 2) * y + x) * 4;
+            bool valid = byte >= 0 && (uint64_t)byte < p->size && p->size - (uint64_t)byte >= 4;
+            uint32_t rgba = 0;
+            if (valid) memcpy(&rgba, (void *)(uintptr_t)(p->storage + byte), 4);
+            static uint64_t count;
+            ++count;
+            RqCpuTexel q = {.addr = p->storage + off, .x = x, .y = y, .components = 1, .component_bytes = 4};
+#ifndef __APPLE__
+            if (valid && (paint_feedback || count <= 64 || !(count % 2000))) {
+                if (rq_enabled()) rq_wait(rq_push(RQ_CPU_TEXEL, &q, 0));
+                else { extern void renderer_cpu_texel(RqCpuTexel *); renderer_cpu_texel(&q); }
+            }
+#endif
+            if (paint_feedback && q.valid) memcpy((void *)(uintptr_t)(p->storage + byte), &q.value, 4);
+            if (paint_feedback && count == 1) LOG("[paint-sync] texel readback enabled; first sample valid %d\n", q.valid);
+            if (paint_trace && (count <= 64 || !(count % 2000)))
+                LOG("[paint-map] #%llu storage %llx size %llx offset %llx xy %u %u pitch %u byte %lld cpu %08x valid %d gpu %08x gpu-valid %d applied %d\n",
+                    (unsigned long long)count, (unsigned long long)p->storage, (unsigned long long)p->size,
+                    (unsigned long long)off, x, y, pitch, (long long)byte, rgba, valid, q.value, q.valid, paint_feedback && q.valid);
+            if (paint_trace && count == 1 && off < p->size) {
+                extern void nvn_log_overlapping_textures(const NvnTexture *, uint64_t, uint64_t);
+                nvn_log_overlapping_textures(NULL, p->storage + off, p->size - off);
+            }
+        }
+    }
+    // The lifted game's direct calls bypass dispatch overrides. Observe the NVN
+    // boundary instead, where the F16 reader has already calculated its row pitch.
+    static int trace = -1;
+    if (trace < 0) trace = getenv("ODYSSEY_LOG_LINREAD") != NULL;
+    static uint64_t count;
+    static int feedback = -1;
+    // On by default (the reactive Cap Kingdom fog needs it); ODYSSEY_FOG_CPU_READBACK=0 switches it off.
+    if (feedback < 0) { const char *e = getenv("ODYSSEY_FOG_CPU_READBACK"); feedback = !e || atoi(e) != 0; }
+    if ((trace || feedback) && fog_f16_map_reader(c->x[30])) {
+        uint32_t nc = c->x[19], comp = c->x[20], y = c->x[21], x = c->x[22];
+        uint64_t off = (uint32_t)c->x[23];
+        // Match the reader's 32-bit madd/mul before its signed halfword indexing.
+        int64_t index = (int32_t)(((uint32_t)c->x[24] * y + x) * nc);
+        int64_t byte = (int64_t)off + index * 2 + (int32_t)comp * 2;
+        uint16_t value = 0;
+        bool valid = byte >= 0 && (uint64_t)byte < p->size && p->size - (uint64_t)byte >= 2;
+#ifndef __APPLE__
+        if (feedback && valid) {
+            RqCpuTexel q = {.addr = p->storage + off, .x = x, .y = y, .component = comp, .components = nc};
+            if (rq_enabled() && !rq_on_thread()) rq_wait(rq_push(RQ_CPU_TEXEL, &q, 0));
+            else { extern void renderer_cpu_texel(RqCpuTexel *); renderer_cpu_texel(&q); }
+            if (q.valid) memcpy((void *)(uintptr_t)(p->storage + byte), &q.value, 2);
+        }
+#endif
+        if (valid) memcpy(&value, (void *)(uintptr_t)(p->storage + byte), 2);
+        ++count;
+        if (trace && (count <= 64 || !(count % 2000)))
+        LOG("[linread-map] #%llu storage %llx size %llx offset %llx xy %u %u nc %u comp %u row-elements %u byte %lld half %04x valid %d\n",
+            (unsigned long long)count, (unsigned long long)p->storage, (unsigned long long)p->size,
+            (unsigned long long)off, x, y, nc, comp, (unsigned)c->x[24], (long long)byte, value, valid);
+    }
+    RET(p->storage);
+}
 NVN(nvnMemoryPoolGetBufferAddress) { RET(HOST(NvnPool, A(0))->storage); }  // GPU address == CPU address
 NVN(nvnMemoryPoolGetSize) { RET(HOST(NvnPool, A(0))->size); }
 NVN(nvnMemoryPoolGetFlags) { RET(HOST(NvnPool, A(0))->flags); }
 NVN(nvnMemoryPoolFlushMappedRange) {
     NvnPool *p = HOST(NvnPool, A(0));
+#ifndef __APPLE__
+    if (p->paint_cpu_shared && A(1) <= p->size && A(2) <= p->size - A(1)) {
+        RqPaintWrite w = {p->storage + A(1), A(2)};
+        if (rq_enabled() && !rq_on_thread()) rq_wait(rq_push(RQ_PAINT_WRITE, &w, 0));
+        else { extern void renderer_paint_cpu_written(uint64_t, uint64_t); renderer_paint_cpu_written(w.addr, w.size); }
+    }
+#endif
     backend_pool_written(p->storage + A(1), A(2));
 }
 NVN(nvnMemoryPoolInvalidateMappedRange) { (void)c; }
@@ -376,19 +516,24 @@ static void builder_layout(uint64_t b, TexLayout *t) {
     }
 }
 
-static bool is_linear(uint64_t b) { return (G(uint32_t, b, 8) & 0x10) || G(uint32_t, b, 0xC) == 10; }
+static bool is_linear(uint64_t b) { return nvn_flags_linear(G(uint32_t, b, 8)) || G(uint32_t, b, 0xC) == 10; }
+
+static uint64_t builder_pitch(uint64_t b, const TexLayout *t) {
+    uint64_t row = ((uint64_t)t->width + t->fmt->bw - 1) / t->fmt->bw * t->fmt->bpb;
+    return nvn_linear_pitch(G(uint32_t, b, 8), row, G(uint64_t, b, 0x30));
+}
 
 static uint64_t builder_storage_size(uint64_t b) {
     if (G(uint32_t, b, 0xC) == 10) {  // buffer texture
         return (uint64_t)G(uint32_t, b, 0x10) * nvn_format_info(G(uint32_t, b, 0x20))->bpb;
     }
-    if (is_linear(b)) return G(uint64_t, b, 0x30) * G(uint32_t, b, 0x14);
     TexLayout t = {0};
     builder_layout(b, &t);
+    if (is_linear(b)) return builder_pitch(b, &t) * t.height;
     return tegra_total_size(&t);
 }
 NVN(nvnTextureBuilderGetStorageSize) { RET(builder_storage_size(A(0))); }
-NVN(nvnTextureBuilderGetStorageAlignment) { RET(is_linear(A(0)) ? 32 : 512); }
+NVN(nvnTextureBuilderGetStorageAlignment) { RET(is_linear(A(0)) ? nvn_linear_alignment(G(uint32_t, A(0), 8)) : 512); }
 
 static NvnTexture *texture_from_builder(uint64_t b) {
     NvnTexture *t = calloc(1, sizeof *t);
@@ -408,6 +553,7 @@ static NvnTexture *texture_from_builder(uint64_t b) {
     t->pool_offset = G(uint64_t, b, 0x40);
     t->addr = t->pool ? t->pool->storage + t->pool_offset : 0;
     builder_layout(b, &t->layout);
+    if (nvn_flags_linear(t->flags)) t->stride = builder_pitch(b, &t->layout);
     t->debug_id = next_debug_id++;
     return t;
 }
@@ -630,7 +776,7 @@ NVN(nvnTextureGetStride) { RET(TEX->stride); }
 NVN(nvnTextureGetTextureAddress) { RET(TEX->addr); }
 NVN(nvnTextureGetMemoryPool) { RET(0); }
 NVN(nvnTextureGetMemoryOffset) { RET(TEX->pool_offset); }
-NVN(nvnTextureGetStorageSize) { RET(tegra_total_size(&TEX->layout)); }
+NVN(nvnTextureGetStorageSize) { RET(nvn_flags_linear(TEX->flags) ? TEX->stride * TEX->height : tegra_total_size(&TEX->layout)); }
 NVN(nvnTextureGetDebugID) { RET(TEX->debug_id); }
 NVN(nvnTextureGetViewOffset) { RET(0); }
 NVN(nvnTextureGetStorageClass) { RET(0); }
@@ -1028,6 +1174,10 @@ NVN(nvnQueuePresentTexture) {
     if (gt_log && gt_out && plat_now_ns() - gt_out < 100000000ull) {
         gt_sum += plat_now_ns() - gt_out;
         if (++gt_n == 600) { LOG("[game-time] %.2f ms a frame outside its present\n", gt_sum / 600.0 / 1e6); gt_sum = gt_n = 0; }
+    }
+    {   // ODYSSEY_SAMPLE_AT=<frame>: the game thread sampled from there (runtime/sampler.c, Linux)
+        extern uint64_t renderer_present_count(void);
+        sampler_frame(renderer_present_count());
     }
     bool rq = rq_enabled();
     if (rq) rq_present_throttle();  // (the render thread one frame behind at most)

@@ -77,12 +77,42 @@ static bool writable(const char *dir) {
 
 void rt_fail(const char *msg) {
     fprintf(stderr, "%s\n", msg);
+#ifdef __linux__
+    plat_error_box(msg);  // (never waits on a hung zenity: runtime/platform/linux.c)
+#else
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, RT_APP_NAME, msg, NULL);
+#endif
     exit(1);
 }
 
 static bool g_dev;  // the data root is a source checkout (it has extracted/)
 bool rt_dev_mode(void) { return g_dev; }
+
+// Where the installer's "Install the game to" choice is kept (DATA_FOLDER_FILE): Windows next to the exe; Linux in
+// $XDG_CONFIG_HOME/super-odyssey-pc-recomp (an AppImage's own folder is read-only), so the game can sit on another drive
+// or a Steam Deck's SD card. false: not kept on this OS (macOS).
+static bool data_folder_file(char *out, size_t n) {
+#ifdef _WIN32
+    return g_exe_dir[0] && (size_t)snprintf(out, n, "%s" SEP DATA_FOLDER_FILE, g_exe_dir) < n;
+#elif defined(__linux__)
+    const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    if (xdg && *xdg == '/') return (size_t)snprintf(out, n, "%s/" RT_LINUX_DIR "/" DATA_FOLDER_FILE, xdg) < n;
+    if (!home || !*home) return false;
+    return (size_t)snprintf(out, n, "%s/.config/" RT_LINUX_DIR "/" DATA_FOLDER_FILE, home) < n;
+#else
+    (void)out, (void)n;
+    return false;
+#endif
+}
+static void read_data_folder(char *named, size_t n) {
+    char file[1100];
+    named[0] = 0;
+    FILE *f = data_folder_file(file, sizeof file) ? fopen(file, "r") : NULL;
+    if (!f) return;
+    if (!fgets(named, (int)n, f)) named[0] = 0;
+    fclose(f);
+    named[strcspn(named, "\r\n")] = 0;
+}
 
 void rt_paths_init(void) {
     if (!getcwd(g_start, sizeof g_start)) g_start[0] = 0;
@@ -98,22 +128,17 @@ void rt_paths_init(void) {
     else if (g_exe_dir[0] && is_dir_in(g_exe_dir, ".." SEP "extracted"))  // build/SuperOdysseyRecomp.exe from a shortcut
         snprintf(root, sizeof root, "%s" SEP "..", g_exe_dir), g_dev = true;
     else {
+        // the folder the installer was told to put the game in (data_folder_file), else the OS's usual place
+        char named[1024];
+        read_data_folder(named, sizeof named);
 #ifdef _WIN32
-        // the folder the installer was told to put the game in (data-folder.txt next to the exe), else the exe's own
-        char named[1024] = "", file[1100];
-        snprintf(file, sizeof file, "%s" SEP DATA_FOLDER_FILE, g_exe_dir);
-        FILE *f = fopen(file, "r");
-        if (f) {
-            if (!fgets(named, sizeof named, f)) named[0] = 0;
-            fclose(f);
-            named[strcspn(named, "\r\n")] = 0;
-        }
         snprintf(root, sizeof root, "%s", named[0] ? named : g_exe_dir);
 #elif defined(__linux__)
-        // $XDG_DATA_HOME/power-moon-recomp, ~/.local/share/power-moon-recomp by default
+        // $XDG_DATA_HOME/super-odyssey-pc-recomp, ~/.local/share/super-odyssey-pc-recomp by default
         const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
-        if (xdg && *xdg == '/') snprintf(root, sizeof root, "%s/power-moon-recomp", xdg);
-        else snprintf(root, sizeof root, "%s/.local/share/power-moon-recomp", home && *home ? home : "/tmp");
+        if (named[0]) snprintf(root, sizeof root, "%s", named);
+        else if (xdg && *xdg == '/') snprintf(root, sizeof root, "%s/" RT_LINUX_DIR, xdg);
+        else snprintf(root, sizeof root, "%s/.local/share/" RT_LINUX_DIR, home && *home ? home : "/tmp");
 #else
         const char *home = getenv("HOME");
         snprintf(root, sizeof root, "%s/Library/Application Support/" RT_BUNDLE_ID, home && *home ? home : "/tmp");
@@ -144,18 +169,27 @@ bool rt_set_data_root(const char *dir) {
     if (!is_dir(dir) || !writable(dir) || chdir(dir) != 0) return false;
     char now[1024];
     if (!getcwd(now, sizeof now)) { if (chdir(cur)) {} return false; }
-#ifdef _WIN32
     char file[1100];
-    snprintf(file, sizeof file, "%s" SEP DATA_FOLDER_FILE, g_exe_dir);
-    if (strcmp(now, g_exe_dir) == 0) {
-        remove(file);  // (back to the program's own folder)
-    } else {
-        FILE *f = fopen(file, "w");
-        if (!f) { if (chdir(cur)) {} return false; }
-        fprintf(f, "%s\n", now);
-        if (fclose(f) != 0) { if (chdir(cur)) {} return false; }
-    }
+    if (data_folder_file(file, sizeof file)) {
+#ifdef _WIN32
+        bool usual = strcmp(now, g_exe_dir) == 0;  // (back to the program's own folder)
+#else
+        bool usual = false;
 #endif
+        if (usual) {
+            remove(file);
+        } else {
+            char dir[1100];
+            snprintf(dir, sizeof dir, "%s", file);
+            char *s = strrchr(dir, '/'), *b = strrchr(dir, '\\');
+            if (b > s) s = b;
+            if (s) *s = 0, mkdirs(dir);
+            FILE *f = fopen(file, "w");
+            if (!f) { if (chdir(cur)) {} return false; }
+            fprintf(f, "%s\n", now);
+            if (fclose(f) != 0) { if (chdir(cur)) {} return false; }
+        }
+    }
     snprintf(g_root, sizeof g_root, "%s", now);
     fprintf(stderr, "[paths] data: %s (chosen in the installer)\n", g_root);
     return true;

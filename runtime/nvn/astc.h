@@ -12,4 +12,5 @@ void astc_decode_ldr(const uint8_t *blocks, uint32_t width, uint32_t height, uin
                      bool srgb, uint8_t *rgba_out);
 
 // One block -> bw*bh*4 bytes (rows of bw texels). Returns false for an error block (output magenta).
+extern _Atomic uint32_t astc_bad_blocks;  // blocks decoded to magenta so far (error blocks, HDR content)
 bool astc_decode_block(const uint8_t block[16], uint32_t bw, uint32_t bh, bool srgb, uint8_t *rgba_out);

@@ -2,8 +2,9 @@
 // Program NCA -> its ExeFS (PFS0, block hashes) and RomFS (IVFC, six hash levels). Decryption with the player's own
 // prod.keys: the NCA header (AES-XTS, header_key), the section key from the key area (key_area_key_application_XX) or a
 // common ticket in the package (titlekek_XX), the sections (AES-CTR). A C port of MacNativeGames' extract_exefs.py and
-// extract_romfs.py (MIT, tools/vendor/macnativegames). Windows: CNG (bcrypt) for AES and SHA-256, wide-character file
-// names (the paths come in as UTF-8). Key values stay in this process's memory, are wiped on close and never logged.
+// extract_romfs.py (MIT, tools/vendor/macnativegames). AES and SHA-256: runtime/nxcrypto.c (the same on every OS). File
+// names come in as UTF-8 (Windows: wide-character calls). Key values stay in this process's memory, are wiped on close
+// and never logged.
 #include "nxpkg.h"
 
 #include <stdio.h>
@@ -12,8 +13,15 @@
 
 #ifdef _WIN32
 #include <windows.h>
-#include <bcrypt.h>
+#else
+#include <errno.h>
+#include <fcntl.h>
+#include <strings.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
+#include "nxcrypto.h"
 #include "rt.h"
 
 #define BASE_TITLE 0x0100000000010000ull
@@ -26,6 +34,17 @@ static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] 
 static uint64_t le64(const uint8_t *p) { return le32(p) | (uint64_t)le32(p + 4) << 32; }
 
 // ------------------------------------------------------------------ files (UTF-8 names)
+#ifdef _WIN32
+typedef HANDLE Fh;
+#define FH_NONE INVALID_HANDLE_VALUE
+#define strcmp_nocase _stricmp
+static bool fh_close(Fh h) { return CloseHandle(h) != 0; }
+static bool fh_size(Fh h, uint64_t *size) {
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz)) return false;
+    *size = (uint64_t)sz.QuadPart;
+    return true;
+}
 static HANDLE open_w(const char *path, bool write) {
     wchar_t w[1100];
     if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1100)) return INVALID_HANDLE_VALUE;
@@ -57,67 +76,80 @@ static bool write_all(HANDLE h, const void *src, size_t n) {
     }
     return true;
 }
-static bool write_file(const char *path, const void *data, size_t n) {
-    HANDLE h = open_w(path, true);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    bool ok = write_all(h, data, n);
-    return CloseHandle(h) && ok;
-}
-
-// ------------------------------------------------------------------ crypto (CNG)
-static BCRYPT_ALG_HANDLE g_aes, g_sha;
-static bool crypto_init(void) {
-    if (g_aes && g_sha) return true;
-    if (!g_aes) {
-        if (BCryptOpenAlgorithmProvider(&g_aes, BCRYPT_AES_ALGORITHM, NULL, 0) < 0) return g_aes = NULL, false;
-        if (BCryptSetProperty(g_aes, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_ECB, sizeof BCRYPT_CHAIN_MODE_ECB, 0) < 0)
-            return false;
-    }
-    if (!g_sha && BCryptOpenAlgorithmProvider(&g_sha, BCRYPT_SHA256_ALGORITHM, NULL, 0) < 0) return g_sha = NULL, false;
+#else  // POSIX
+typedef int Fh;
+#define FH_NONE (-1)
+#define strcmp_nocase strcasecmp
+static bool fh_close(Fh h) { return close(h) == 0; }
+static bool fh_size(Fh h, uint64_t *size) {
+    struct stat st;
+    if (fstat(h, &st)) return false;
+    *size = (uint64_t)st.st_size;
     return true;
 }
-static BCRYPT_KEY_HANDLE aes_key(const uint8_t key[16]) {
-    BCRYPT_KEY_HANDLE k = NULL;
-    return BCryptGenerateSymmetricKey(g_aes, &k, NULL, 0, (PUCHAR)key, 16, 0) < 0 ? NULL : k;
+static Fh open_w(const char *path, bool write) {
+    return open(path, write ? O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC : O_RDONLY | O_CLOEXEC, 0644);
 }
-static bool ecb(BCRYPT_KEY_HANDLE k, bool enc, const uint8_t *in, uint8_t *out, size_t n) {
-    ULONG got = 0;
-    NTSTATUS s = enc ? BCryptEncrypt(k, (PUCHAR)in, (ULONG)n, NULL, NULL, 0, out, (ULONG)n, &got, 0)
-                     : BCryptDecrypt(k, (PUCHAR)in, (ULONG)n, NULL, NULL, 0, out, (ULONG)n, &got, 0);
-    return s >= 0 && got == n;
+static bool mkdir_w(const char *path) { return mkdir(path, 0755) == 0 || errno == EEXIST; }
+static bool read_at(Fh h, uint64_t off, void *dst, size_t n) {
+    uint8_t *d = dst;
+    while (n) {
+        ssize_t got = pread(h, d, n > (1u << 30) ? (1u << 30) : n, (off_t)off);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) return false;
+        d += got, off += (uint64_t)got, n -= (size_t)got;
+    }
+    return true;
 }
+static bool write_all(Fh h, const void *src, size_t n) {
+    const uint8_t *s = src;
+    while (n) {
+        ssize_t put = write(h, s, n > (1u << 30) ? (1u << 30) : n);
+        if (put < 0 && errno == EINTR) continue;
+        if (put <= 0) return false;
+        s += put, n -= (size_t)put;
+    }
+    return true;
+}
+#endif
+static bool write_file(const char *path, const void *data, size_t n) {
+    Fh h = open_w(path, true);
+    if (h == FH_NONE) return false;
+    bool ok = write_all(h, data, n);
+    return fh_close(h) && ok;
+}
+
+// ------------------------------------------------------------------ crypto (runtime/nxcrypto.c)
 static bool ecb_once(const uint8_t key[16], bool enc, const uint8_t *in, uint8_t *out, size_t n) {
-    BCRYPT_KEY_HANDLE k = aes_key(key);
-    if (!k) return false;
-    bool ok = ecb(k, enc, in, out, n);
-    BCryptDestroyKey(k);
-    return ok;
+    NxAes k;
+    nx_aes_init(&k, key);
+    if (enc) nx_aes_encrypt(&k, in, out, n);
+    else nx_aes_decrypt(&k, in, out, n);
+    nx_wipe(&k, sizeof k);
+    return true;
 }
-static void sha256(const void *data, size_t n, uint8_t out[32]) {
-    BCryptHash(g_sha, NULL, 0, (PUCHAR)data, (ULONG)n, out, 32);
-}
+static void sha256(const void *data, size_t n, uint8_t out[32]) { nx_sha256(data, n, out); }
 
 // AES-XTS decryption of the NCA header: 0x200-byte sectors, the sector number as a big-endian tweak (Nintendo's).
 static bool xts_decrypt(const uint8_t key[32], uint8_t *buf, size_t n) {
-    BCRYPT_KEY_HANDLE k1 = aes_key(key), k2 = aes_key(key + 16);
-    bool ok = k1 && k2;
-    for (size_t sec = 0; ok && sec * 0x200 < n; sec++) {
+    NxAes k1, k2;
+    nx_aes_init(&k1, key), nx_aes_init(&k2, key + 16);
+    for (size_t sec = 0; sec * 0x200 < n; sec++) {
         uint8_t tw[16] = {0}, t[16];
         for (int i = 0; i < 8; i++) tw[15 - i] = (uint8_t)(sec >> (8 * i));
-        ok = ecb(k2, true, tw, t, 16);
-        for (size_t b = 0; ok && b < 0x200; b += 16) {
+        nx_aes_encrypt(&k2, tw, t, 16);
+        for (size_t b = 0; b < 0x200; b += 16) {
             uint8_t *p = buf + sec * 0x200 + b, x[16];
             for (int i = 0; i < 16; i++) x[i] = p[i] ^ t[i];
-            ok = ecb(k1, false, x, x, 16);
+            nx_aes_decrypt(&k1, x, x, 16);
             for (int i = 0; i < 16; i++) p[i] = x[i] ^ t[i];
             uint8_t carry = t[15] >> 7;  // t *= alpha in GF(2^128), little-endian
             for (int i = 15; i > 0; i--) t[i] = (uint8_t)(t[i] << 1 | t[i - 1] >> 7);
             t[0] = (uint8_t)(t[0] << 1) ^ (carry ? 0x87 : 0);
         }
     }
-    if (k1) BCryptDestroyKey(k1);
-    if (k2) BCryptDestroyKey(k2);
-    return ok;
+    nx_wipe(&k1, sizeof k1), nx_wipe(&k2, sizeof k2);
+    return true;
 }
 
 // ------------------------------------------------------------------ prod.keys
@@ -127,15 +159,15 @@ typedef struct { Key *k; int n; } Keys;
 static int hexval(int c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; }
 
 static bool keys_load(Keys *ks, const char *path) {
-    HANDLE h = open_w(path, false);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER sz;
-    if (!GetFileSizeEx(h, &sz) || sz.QuadPart > (1 << 20)) { CloseHandle(h); return false; }
-    char *t = malloc((size_t)sz.QuadPart + 1);
-    bool ok = t && read_at(h, 0, t, (size_t)sz.QuadPart);
-    CloseHandle(h);
+    Fh h = open_w(path, false);
+    if (h == FH_NONE) return false;
+    uint64_t sz = 0;
+    if (!fh_size(h, &sz) || sz > (1 << 20)) { fh_close(h); return false; }
+    char *t = malloc((size_t)sz + 1);
+    bool ok = t && read_at(h, 0, t, (size_t)sz);
+    fh_close(h);
     if (!ok) { free(t); return false; }
-    t[sz.QuadPart] = 0;
+    t[sz] = 0;
     ks->k = NULL, ks->n = 0;
     for (char *line = t, *next; line && *line; line = next) {
         next = strchr(line, '\n');
@@ -159,9 +191,9 @@ static bool keys_load(Keys *ks, const char *path) {
         if (!grown) break;
         ks->k = grown;
         ks->k[ks->n++] = k;
-        SecureZeroMemory(&k, sizeof k);
+        nx_wipe(&k, sizeof k);
     }
-    SecureZeroMemory(t, (size_t)sz.QuadPart);
+    nx_wipe(t, (size_t)sz);
     free(t);
     return true;
 }
@@ -171,7 +203,7 @@ static const Key *key_get(const Keys *ks, const char *name, int len) {
     return NULL;
 }
 static void keys_free(Keys *ks) {
-    if (ks->k) SecureZeroMemory(ks->k, sizeof(Key) * (size_t)ks->n);
+    if (ks->k) nx_wipe(ks->k, sizeof(Key) * (size_t)ks->n);
     free(ks->k);
     ks->k = NULL, ks->n = 0;
 }
@@ -180,7 +212,7 @@ static void keys_free(Keys *ks) {
 typedef struct { char name[256]; uint64_t off, size; } Entry;
 
 struct NxPkg {
-    HANDLE f;
+    Fh f;
     uint64_t size;
     Keys keys;
     Entry *e;
@@ -219,7 +251,7 @@ static bool partition(NxPkg *p, uint64_t off, uint64_t bound, bool hfs, Entry **
 
 static bool ends_with(const char *s, const char *suf) {
     size_t a = strlen(s), b = strlen(suf);
-    return a >= b && !_stricmp(s + a - b, suf);
+    return a >= b && !strcmp_nocase(s + a - b, suf);
 }
 
 // The NCA header at off (size bytes), decrypted into hdr. false: not an NCA3 these keys open.
@@ -250,7 +282,7 @@ static bool ticket_key(NxPkg *p, const uint8_t rid[16], uint8_t key[16]) {
         uint8_t d[0x180];
         if (p->e[i].size < body + 0x180 || !read_at(p->f, p->e[i].off + body, d, sizeof d)) continue;
         if (d[0x141] != 0) continue;  // personalized: not a common title key
-        if (!memcmp(d + 0x160, rid, 16)) { memcpy(key, d + 0x40, 16); SecureZeroMemory(d, sizeof d); return true; }
+        if (!memcmp(d + 0x160, rid, 16)) { memcpy(key, d + 0x40, 16); nx_wipe(d, sizeof d); return true; }
     }
     return false;
 }
@@ -259,16 +291,13 @@ static bool ticket_key(NxPkg *p, const uint8_t rid[16], uint8_t key[16]) {
 static NxPkg *open_pkg(const char *package, const char *keys, bool update, char *why, size_t why_size) {
     NxPkg *p = calloc(1, sizeof *p);
     if (!p) return NULL;
-    p->f = INVALID_HANDLE_VALUE;
+    p->f = FH_NONE;
     bool found_update = false, found_other = false, found_base = false;
-    if (!crypto_init()) FAIL("This PC's encryption functions (Windows CNG) couldn't be used.");
     if (!keys_load(&p->keys, keys)) FAIL("prod.keys couldn't be read. Choose the prod.keys file dumped from your console.");
     if (!key_get(&p->keys, "header_key", 32))
         FAIL("That keys file has no header_key. Choose the prod.keys file dumped from your own console (not title.keys).");
     p->f = open_w(package, false);
-    LARGE_INTEGER sz;
-    if (p->f == INVALID_HANDLE_VALUE || !GetFileSizeEx(p->f, &sz)) FAIL("The game file couldn't be opened.");
-    p->size = (uint64_t)sz.QuadPart;
+    if (p->f == FH_NONE || !fh_size(p->f, &p->size)) FAIL("The game file couldn't be opened.");
     uint8_t m[4];
     if (!read_at(p->f, 0, m, 4)) FAIL("The game file couldn't be read.");
     if (!memcmp(m, "PFS0", 4)) {
@@ -329,7 +358,7 @@ static NxPkg *open_pkg(const char *package, const char *keys, bool update, char 
             const Key *k = key_get(&p->keys, name, 16);
             if (!k) FAIL("prod.keys has no %s: dump the keys from your console again (current firmware).", name);
             bool ok = ecb_once(k->v, false, enc, p->ctr_key, 16);
-            SecureZeroMemory(enc, sizeof enc);
+            nx_wipe(enc, sizeof enc);
             if (!ok) FAIL("The title key couldn't be decrypted.");
         } else {
             if (p->hdr[0x207] != 0) FAIL("Unsupported key area in the game file.");
@@ -339,7 +368,7 @@ static NxPkg *open_pkg(const char *package, const char *keys, bool update, char 
             uint8_t area[64];
             bool ok = ecb_once(k->v, false, p->hdr + 0x300, area, 64);
             memcpy(p->ctr_key, area + 32, 16);
-            SecureZeroMemory(area, sizeof area);
+            nx_wipe(area, sizeof area);
             if (!ok) FAIL("The game file's key area couldn't be decrypted.");
         }
     }
@@ -362,15 +391,15 @@ NxPkg *nxpkg_open_update(const char *package, const char *keys, char *why, size_
 
 void nxpkg_close(NxPkg *p) {
     if (!p) return;
-    if (p->f != INVALID_HANDLE_VALUE) CloseHandle(p->f);
+    if (p->f != FH_NONE) fh_close(p->f);
     keys_free(&p->keys);
     free(p->e);
-    SecureZeroMemory(p, sizeof *p);
+    nx_wipe(p, sizeof *p);
     free(p);
 }
 
 // ------------------------------------------------------------------ sections
-typedef struct { NxPkg *p; const uint8_t *fs; uint64_t start, size; BCRYPT_KEY_HANDLE key; uint8_t *ks; } Section;
+typedef struct { NxPkg *p; const uint8_t *fs; uint64_t start, size; NxAes key; uint8_t *ks; } Section;
 
 static bool section_open(NxPkg *p, int i, Section *s) {
     uint64_t st = (uint64_t)le32(p->hdr + 0x240 + i * 16) * 0x200, en = (uint64_t)le32(p->hdr + 0x244 + i * 16) * 0x200;
@@ -380,12 +409,12 @@ static bool section_open(NxPkg *p, int i, Section *s) {
     sha256(fs, 0x200, h);
     if (memcmp(h, p->hdr + 0x280 + i * 32, 32)) return false;
     s->p = p, s->fs = fs, s->start = st, s->size = en - st;
-    s->key = aes_key(p->ctr_key);
+    nx_aes_init(&s->key, p->ctr_key);
     s->ks = malloc(CHUNK + 32);
-    return s->key && s->ks;
+    return s->ks != NULL;
 }
 static void section_close(Section *s) {
-    if (s->key) BCryptDestroyKey(s->key);
+    nx_wipe(&s->key, sizeof s->key);
     free(s->ks);
 }
 // size bytes at rel in the section, decrypted (AES-CTR: the section's counter, then the 16-byte block number).
@@ -403,7 +432,7 @@ static bool section_read_ctr(Section *s, uint64_t rel, uint8_t *dst, size_t size
             uint64_t blk = aligned / 16 + b;
             for (int j = 0; j < 8; j++) c[15 - j] = (uint8_t)(blk >> (8 * j));
         }
-        if (!ecb(s->key, true, ctr, ctr, blocks * 16)) return false;
+        nx_aes_encrypt(&s->key, ctr, ctr, blocks * 16);
         if (skip) {
             uint8_t first[16];
             if (!read_at(s->p->f, s->p->nca_off + aligned, first, 16)) return false;
@@ -494,7 +523,7 @@ typedef bool (*ReadFn)(void *ctx, uint64_t off, uint8_t *dst, size_t n);
 static bool extract_ivfc(const uint8_t *fs, ReadFn rd, void *rctx, const char *out, void (*progress)(uint64_t, uint64_t),
                          char *why, size_t why_size) {
     uint8_t *parent = NULL, *next = NULL, *buf = malloc(CHUNK);
-    HANDLE o = INVALID_HANDLE_VALUE;
+    Fh o = FH_NONE;
     if (!buf) FAIL("Out of memory.");
     if (le32(fs + 12) != 0x20000 || le32(fs + 16) != 32 || le32(fs + 20) != 7) FAIL("Unsupported game data layout.");
     size_t plen = 32;
@@ -505,7 +534,7 @@ static bool extract_ivfc(const uint8_t *fs, ReadFn rd, void *rctx, const char *o
     for (int l = 0; l < 6; l++) total += le64(fs + 0x18 + l * 24 + 8);
     uint64_t done = 0;
     o = open_w(out, true);
-    if (o == INVALID_HANDLE_VALUE) FAIL("%s couldn't be written.", out);
+    if (o == FH_NONE) FAIL("%s couldn't be written.", out);
     for (int l = 0; l < 6; l++) {
         const uint8_t *lv = fs + 0x18 + l * 24;
         uint64_t off = le64(lv), size = le64(lv + 8);
@@ -539,13 +568,13 @@ static bool extract_ivfc(const uint8_t *fs, ReadFn rd, void *rctx, const char *o
         }
         if (l < 5) { free(parent); parent = next; next = NULL; plen = (size_t)size; }
     }
-    if (!CloseHandle(o)) { o = INVALID_HANDLE_VALUE; FAIL("Writing the game data failed (disk full?)."); }
-    o = INVALID_HANDLE_VALUE;
+    if (!fh_close(o)) { o = FH_NONE; FAIL("Writing the game data failed (disk full?)."); }
+    o = FH_NONE;
     free(buf), free(parent);
     LOG("[nxpkg] RomFS: %llu bytes, all six hash levels verified\n", (unsigned long long)le64(fs + 0x18 + 5 * 24 + 8));
     return true;
 fail:
-    if (o != INVALID_HANDLE_VALUE) CloseHandle(o);
+    if (o != FH_NONE) fh_close(o);
     free(buf), free(parent), free(next);
     LOG("[nxpkg] RomFS: %s\n", why ? why : "failed");
     return false;
@@ -686,7 +715,7 @@ bool nxpkg_extract_romfs_patched(NxPkg *base, NxPkg *update, const char *out, vo
 }
 
 // ------------------------------------------------------------------ a folder out of a RomFS image
-static bool copy_dir(HANDLE img, const uint8_t *hd, const uint8_t *dirs, uint64_t ndirs, const uint8_t *files, uint64_t nfiles,
+static bool copy_dir(Fh img, const uint8_t *hd, const uint8_t *dirs, uint64_t ndirs, const uint8_t *files, uint64_t nfiles,
                      uint32_t d, const char *out, uint8_t *buf, int depth) {
     if (depth > 32 || (uint64_t)d + 24 > ndirs || !mkdir_w(out)) return false;
     uint32_t child = le32(dirs + d + 8), file = le32(dirs + d + 12);
@@ -700,14 +729,14 @@ static bool copy_dir(HANDLE img, const uint8_t *hd, const uint8_t *dirs, uint64_
         memcpy(name, e + 32, nl), name[nl] = 0;
         if (strpbrk(name, "/\\:") || !strcmp(name, "..")) return false;
         snprintf(path, sizeof path, "%s/%s", out, name);
-        HANDLE w = open_w(path, true);
-        if (w == INVALID_HANDLE_VALUE) return false;
+        Fh w = open_w(path, true);
+        if (w == FH_NONE) return false;
         bool ok = true;
         for (uint64_t pos = 0; ok && pos < size; pos += CHUNK) {
             size_t n = (size_t)(size - pos < CHUNK ? size - pos : CHUNK);
             ok = read_at(img, le64(hd + 72) + data + pos, buf, n) && write_all(w, buf, n);
         }
-        if (!CloseHandle(w) || !ok) return false;
+        if (!fh_close(w) || !ok) return false;
         file = le32(e + 4);
     }
     for (int guard = 0; child != 0xFFFFFFFFu && guard < 100000; guard++) {
@@ -726,8 +755,8 @@ static bool copy_dir(HANDLE img, const uint8_t *hd, const uint8_t *dirs, uint64_
 
 bool romfs_image_extract_dir(const char *image, const char *dir, const char *out, char *why, size_t why_size) {
     uint8_t hd[80], *dirs = NULL, *files = NULL, *buf = NULL;
-    HANDLE img = open_w(image, false);
-    if (img == INVALID_HANDLE_VALUE || !read_at(img, 0, hd, 80) || le64(hd) != 80) FAIL("The game data image can't be read.");
+    Fh img = open_w(image, false);
+    if (img == FH_NONE || !read_at(img, 0, hd, 80) || le64(hd) != 80) FAIL("The game data image can't be read.");
     uint64_t doff = le64(hd + 24), dsz = le64(hd + 32), foff = le64(hd + 56), fsz = le64(hd + 64);
     if (dsz > (64u << 20) || fsz > (64u << 20)) FAIL("The game data image is broken.");
     dirs = malloc(dsz ? dsz : 1), files = malloc(fsz ? fsz : 1), buf = malloc(CHUNK);
@@ -744,42 +773,12 @@ bool romfs_image_extract_dir(const char *image, const char *dir, const char *out
     }
     if (c == 0xFFFFFFFFu || (uint64_t)c + 24 > dsz) FAIL("The game data has no %s folder.", dir);
     if (!copy_dir(img, hd, dirs, dsz, files, fsz, c, out, buf, 0)) FAIL("Copying %s out of the game data failed.", dir);
-    CloseHandle(img);
+    fh_close(img);
     free(dirs), free(files), free(buf);
     return true;
 fail:
-    if (img != INVALID_HANDLE_VALUE) CloseHandle(img);
+    if (img != FH_NONE) fh_close(img);
     free(dirs), free(files), free(buf);
     LOG("[nxpkg] %s from %s: %s\n", dir, image, why ? why : "failed");
     return false;
 }
-
-#else  // not Windows: game packages aren't read here (extracted folders only)
-
-struct NxPkg { int unused; };
-NxPkg *nxpkg_open(const char *package, const char *keys, char *why, size_t why_size) {
-    (void)package, (void)keys;
-    if (why && why_size) snprintf(why, why_size, "Game packages (NSP, XCI) can only be read on Windows so far.");
-    return NULL;
-}
-void nxpkg_close(NxPkg *p) { (void)p; }
-bool nxpkg_extract_exefs(NxPkg *p, const char *dir, char *why, size_t why_size) { (void)p, (void)dir, (void)why, (void)why_size; return false; }
-uint64_t nxpkg_romfs_size(NxPkg *p) { (void)p; return 0; }
-bool nxpkg_extract_romfs(NxPkg *p, const char *out, void (*progress)(uint64_t, uint64_t), char *why, size_t why_size) {
-    (void)p, (void)out, (void)progress, (void)why, (void)why_size;
-    return false;
-}
-bool romfs_image_extract_dir(const char *image, const char *dir, const char *out, char *why, size_t why_size) {
-    (void)image, (void)dir, (void)out;
-    if (why && why_size) snprintf(why, why_size, "not supported here");
-    return false;
-}
-NxPkg *nxpkg_open_update(const char *package, const char *keys, char *why, size_t why_size) {
-    return nxpkg_open(package, keys, why, why_size);
-}
-bool nxpkg_extract_romfs_patched(NxPkg *base, NxPkg *update, const char *out, void (*progress)(uint64_t, uint64_t),
-                                 char *why, size_t why_size) {
-    (void)base, (void)update, (void)out, (void)progress, (void)why, (void)why_size;
-    return false;
-}
-#endif

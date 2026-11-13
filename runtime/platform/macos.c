@@ -24,6 +24,8 @@ static mach_timebase_info_data_t tb;
 // here). Processes started by this one (the re-exec for a fresh address layout) append to the same log.
 #include <sys/stat.h>
 #include "../paths.h"
+static char g_log_path[1024];
+const char *plat_log_path(void) { return g_log_path; }
 static void log_to_file_without_terminal(void) {
     if (isatty(STDERR_FILENO)) return;
     char dir[900], path[1024];
@@ -38,6 +40,7 @@ static void log_to_file_without_terminal(void) {
     snprintf(path, sizeof path, "%s/SuperOdysseyRecomp.log", dir);
     bool append = getenv("ODYSSEY_LOG_APPEND") != NULL;
     if (!freopen(path, append ? "a" : "w", stderr)) return;
+    snprintf(g_log_path, sizeof g_log_path, "%s", path);
     dup2(STDERR_FILENO, STDOUT_FILENO);
     setenv("ODYSSEY_LOG_APPEND", "1", 1);
 }
@@ -115,6 +118,8 @@ const char *plat_symbol(uint64_t pc, uint64_t *offset) {
 }
 
 uint64_t plat_private_bytes(void) { return 0; }
+uint64_t plat_resident_bytes(void) { return 0; }
+uint64_t plat_total_ram(void) { return 0; }
 uint64_t plat_guest_bytes(void) { return 0; }
 uint64_t plat_heap_bytes(void) { return 0; }
 void plat_heap_histogram(void) {}

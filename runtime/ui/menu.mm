@@ -28,6 +28,7 @@ extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.c
 extern "C" {
 #include "../hle.h"
 #include "../mods.h"
+#include "../diagnostics.h"
 #include "../settings.h"
 #include "../updater.h"
 #include "menu.h"
@@ -46,6 +47,33 @@ static std::atomic<bool> g_text_busy{false};  // a text field / the on-screen ke
 static std::atomic<bool> g_want_window_apply{false};
 static std::atomic<bool> g_draw_mouse_cursor{false};
 static std::atomic<int> g_last_fullscreen{BORDERLESS};
+struct DisplayChoice { SDL_DisplayID id; char label[160]; };
+static std::vector<DisplayChoice> g_displays;
+static pthread_mutex_t g_displays_mutex = PTHREAD_MUTEX_INITIALIZER;
+static std::atomic<bool> g_displays_dirty{true};
+
+// SDL display queries and window changes stay on the event thread. The renderer
+// only consumes this snapshot to draw the settings row.
+static void refresh_displays(void) {
+    if (!g_displays_dirty.exchange(false)) return;
+    int count = 0;
+    SDL_DisplayID *ids = SDL_GetDisplays(&count);
+    std::vector<DisplayChoice> choices;
+    DisplayChoice automatic = {};
+    snprintf(automatic.label, sizeof automatic.label, "Current display");
+    choices.push_back(automatic);
+    for (int i = 0; ids && i < count && i < 64; i++) {
+        DisplayChoice d = {}; d.id = ids[i];
+        const char *name = SDL_GetDisplayName(d.id);
+        const SDL_DisplayMode *mode = SDL_GetDesktopDisplayMode(d.id);
+        snprintf(d.label, sizeof d.label, "%d: %s (%d x %d)", i + 1, name ? name : "Display", mode ? mode->w : 0, mode ? mode->h : 0);
+        choices.push_back(d);
+    }
+    SDL_free(ids);
+    pthread_mutex_lock(&g_displays_mutex);
+    g_displays.swap(choices);
+    pthread_mutex_unlock(&g_displays_mutex);
+}
 extern "C" bool menu_stats_visible(void) {
     return g_settings.show_fps || g_settings.performance_overlay;
 }
@@ -194,6 +222,10 @@ extern "C" bool menu_overlay_lockfree(void) { return !capturing() && (!menu_stat
 extern "C" bool menu_input_captured(void) { return capturing(); }
 
 bool menu_handle_event(const SDL_Event *e) {
+    if (e->type == SDL_EVENT_DISPLAY_ADDED || e->type == SDL_EVENT_DISPLAY_REMOVED) {
+        g_displays_dirty.store(true);
+        g_want_window_apply.store(true);
+    }
     static SDL_JoystickID back_pad, start_pad;
     static bool stick_down[4];
     if (e->type == SDL_EVENT_WINDOW_FOCUS_GAINED) g_app_unfocused = false;
@@ -327,6 +359,7 @@ void menu_request_window_apply(void) { g_want_window_apply.store(true); }
 
 void menu_apply_window_requests(void *win) {
     SDL_Window *w = (SDL_Window *)win;
+    refresh_displays();
     g_pixel_density = SDL_GetWindowPixelDensity(w);
     static bool text_input;
     bool want_text = capturing();
@@ -345,6 +378,22 @@ void menu_apply_window_requests(void *win) {
     int mode = g_settings.window_mode;
     int height = settings_display_height(g_settings.display_resolution);
     SDL_DisplayID display = SDL_GetDisplayForWindow(w);
+    SDL_DisplayID target = 0;
+    pthread_mutex_lock(&g_displays_mutex);
+    if (g_settings.monitor > 0) {
+        target = g_settings.monitor < (int)g_displays.size() ? g_displays[g_settings.monitor].id : SDL_GetPrimaryDisplay();
+    }
+    pthread_mutex_unlock(&g_displays_mutex);
+    if (target && target != display) {
+        if (!SDL_SetWindowFullscreen(w, false) || !SDL_SetWindowFullscreenMode(w, NULL) || !SDL_SyncWindow(w) ||
+            !SDL_SetWindowPosition(w, SDL_WINDOWPOS_CENTERED_DISPLAY(target), SDL_WINDOWPOS_CENTERED_DISPLAY(target)) ||
+            !SDL_SyncWindow(w)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "Could not move the game to the selected display: %s", SDL_GetError());
+            return;
+        }
+        display = SDL_GetDisplayForWindow(w);
+        SDL_Log("Game display: %s", SDL_GetDisplayName(display));
+    }
     const SDL_DisplayMode *desktop = SDL_GetDesktopDisplayMode(display);
     bool applied;
     if (mode == WINDOWED) {
@@ -547,13 +596,30 @@ extern "C" double output_scale_dynamic_factor(void);
 extern "C" bool vk_prepare_requested(void);       // runtime/nvn/vulkan/device.c (the menu's Compile shaders)
 extern "C" void vk_prepare_request(bool on);
 #ifdef _WIN32
-extern "C" bool vk_dlss_enabled(void);
+extern "C" bool vk_temporal_enabled(void);
+extern "C" bool vk_fsr3_available(void);
+extern "C" bool vk_fsr4_available(void);
+extern "C" bool vk_xess_available(void);
 #endif
 
 static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
     opt_begin("##video", scale);
     opt_section("Display");
+    pthread_mutex_lock(&g_displays_mutex);
+    if (!g_displays.empty()) {
+        std::vector<const char *> labels;
+        for (const DisplayChoice &d : g_displays) labels.push_back(d.label);
+        int selected = g_settings.monitor >= 0 && g_settings.monitor < (int)labels.size() ? g_settings.monitor : 0;
+        if (opt_choice("Monitor", &selected, labels.data(), (int)labels.size(), 0,
+                       "Moves the game to the selected display. Works in windowed, borderless and exclusive fullscreen. "
+                       "Current display leaves window placement to you. Display numbers follow the connected display list; "
+                       "select again if that list changes. An unavailable display falls back to the primary display.")) {
+            g_settings.monitor = selected;
+            menu_request_window_apply();
+        }
+    }
+    pthread_mutex_unlock(&g_displays_mutex);
     static const char *window_modes[] = {"Windowed", "Borderless", "Exclusive fullscreen"};
     if (opt_choice("Display mode", &g_settings.window_mode, window_modes, WINDOW_MODE_COUNT, WINDOWED,
                    "Borderless uses the desktop's resolution. Exclusive fullscreen requests a monitor display mode. "
@@ -604,9 +670,9 @@ static void tab_graphics(void) {
         if (g_settings.res_mode == RES_DYNAMIC)
             snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
 #ifdef _WIN32
-        if (vk_dlss_enabled()) {
-            snprintf(d, sizeof d, "Match display lets DLSS choose its usual input size. A fixed resolution overrides that "
-                     "size. At or above the display resolution, DLSS upscaling is bypassed. DLAA applies at equal sizes.\n\n"
+        if (vk_temporal_enabled()) {
+            snprintf(d, sizeof d, "Match display lets the temporal upscaler choose its usual input size. A fixed resolution overrides that "
+                     "size. At or above the display resolution, upscaling is bypassed. Native AA/DLAA applies at equal sizes.\n\n"
                      "Rendering at %.0f x %.0f.", 1600.0 * sx, 900.0 * sy);
         }
 #endif
@@ -626,7 +692,7 @@ static void tab_graphics(void) {
         char udm[512];
         if (g_settings.res_mode == RES_MATCH
 #ifdef _WIN32
-            && !vk_dlss_enabled()
+            && !vk_temporal_enabled()
 #endif
         ) {  // (renders at the window's size: nothing to scale up)
             snprintf(udm, sizeof udm, "%s\n\nNot used at Match display: the game already renders at your display's resolution.", ud);
@@ -638,7 +704,7 @@ static void tab_graphics(void) {
 #else
         constexpr int default_upscaler = 0;
 #endif
-        if (opt_choice("Upscaler", &ui, ups, 2, default_upscaler, ud)) g_settings.upscaler = ui ? UPSCALE_SHARP : UPSCALE_BILINEAR;
+        if (opt_choice("Spatial upscaler", &ui, ups, 2, default_upscaler, ud)) g_settings.upscaler = ui ? UPSCALE_SHARP : UPSCALE_BILINEAR;
     }
     opt_section("Anti-aliasing");
     static const char *aa[] = {"Off", "SMAA"};
@@ -646,22 +712,48 @@ static void tab_graphics(void) {
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
 #ifdef _WIN32
-    opt_section("NVIDIA DLSS");
-    {
+    opt_section("Temporal upscaling");
+    static const char *backends[] = {"NVIDIA DLSS", "AMD FSR 3.1", "AMD FSR 4 (Beta)", "Intel XeSS (Beta)"};
+    opt_choice("Temporal upscaler", &g_settings.temporal_backend, backends, TEMPORAL_BACKEND_COUNT, TEMPORAL_DLSS,
+               "Selects the temporal anti-aliasing/upscaling technique. Each keeps its own mode and sharpening settings. Changes during play.");
+    int backend = g_settings.temporal_backend;
+    bool fsr = backend == TEMPORAL_FSR3 || backend == TEMPORAL_FSR4;
+    if (backend != TEMPORAL_DLSS) {
+        static const char *modes[] = {"Off", "Native AA", "Quality", "Balanced", "Performance"};
+        const char *help = backend == TEMPORAL_XESS ?
+            "Experimental Intel XeSS-SR. Native AA, Quality (1.7x), Balanced (2x) and Performance (2.3x). Requires a compatible Vulkan driver and Intel's runtime. Changes during play." :
+            "AMD temporal reconstruction. Native AA uses display resolution; other modes render at lower input resolutions. Changes during play.";
+        if (backend == TEMPORAL_FSR4 && !vk_fsr4_available()) help =
+            "FSR 4 ML is unavailable on this GPU/runtime. FSR 3.1 is used when supported; otherwise the game uses regular rendering. The status below shows the active path.";
+        opt_choice(backend == TEMPORAL_XESS ? "XeSS mode" : backend == TEMPORAL_FSR4 ? "FSR 4 mode" : "FSR 3.1 mode",
+                   settings_temporal_mode(), modes, DLSS_MODE_COUNT, DLSS_QUALITY, help);
+        const char *status = *settings_temporal_mode() == DLSS_OFF ? "Off" : backend == TEMPORAL_XESS ?
+            (vk_xess_available() ? "XeSS" : "Regular rendering") : backend == TEMPORAL_FSR4 && vk_fsr4_available() ? "FSR 4 ML" :
+            vk_fsr3_available() ? (backend == TEMPORAL_FSR4 ? "FSR 3.1 fallback" : "FSR 3.1") : "Regular rendering";
+        opt_disable_next(); opt_action("Upscaler status", status, "The available rendering path. Unsupported experimental techniques do not run on incompatible hardware.");
+    } else {
         static const char *modes[] = {"Off", "DLAA", "Quality", "Balanced", "Performance"};
         static const char *presets[] = {"Default", "K", "L", "M"};
         opt_choice("DLSS mode", &g_settings.dlss_mode, modes, DLSS_MODE_COUNT, DLSS_OFF,
                    "DLAA anti-aliases at display resolution. Quality, Balanced and Performance render at progressively "
-                   "lower resolutions. Off takes effect immediately. Restart after selecting another mode.");
+                   "lower resolutions. Changes apply during play; history resets while the new mode is prepared.");
         opt_choice("DLSS preset", &g_settings.dlss_preset, presets, DLSS_PRESET_COUNT, DLSS_PRESET_DEFAULT,
-                   "Model hint for NVIDIA DLSS. Default lets the installed model choose. Applies on the next launch.");
-        opt_toggle("CAS sharpening", &g_settings.dlss_cas, false,
-                   "Applies AMD FidelityFX Contrast Adaptive Sharpening after DLSS or DLAA. Changes at once.");
-        if (!g_settings.dlss_cas) opt_disable_next();
-        float sharpness = (float)g_settings.dlss_sharpness;
-        if (opt_slider("CAS strength", &sharpness, 10, 100, 10, 20, "%g%%",
-                       "Adjusts the amount of sharpening. Changes at once."))
-            g_settings.dlss_sharpness = (int)sharpness;
+                   "Model hint for NVIDIA DLSS. Default uses K for DLAA/Quality/Balanced and M for Performance. Changes during play.");
+    }
+    if (*settings_temporal_mode() != DLSS_OFF) {
+        float strength = (float)*settings_temporal_sharpness();
+        if (opt_slider(fsr ? "FSR sharpness" : backend == TEMPORAL_XESS ? "XeSS sharpness (RCAS)" : "DLSS sharpness (RCAS)",
+                       &strength, 0, 100, 10, 20, "%g%%", "Reconstruction sharpening. 0% bypasses it. Saved independently for each technique; changes at once."))
+            *settings_temporal_sharpness() = (int)strength;
+        opt_toggle("CAS sharpening", settings_temporal_cas(), false, "Optional CAS after reconstruction, independent of the sharpening above.");
+        if (!*settings_temporal_cas()) opt_disable_next();
+        float amount = (float)*settings_temporal_cas_sharpness();
+        if (opt_slider("CAS sharpness", &amount, 0, 100, 10, 20, "%g%%", "Optional CAS strength, saved separately for each technique. 0% bypasses the pass."))
+            *settings_temporal_cas_sharpness() = (int)amount;
+    } else if (g_settings.upscaler == UPSCALE_FSR1) {
+        float amount = (float)g_settings.fsr1_sharpness;
+        if (opt_slider("Sharpness", &amount, 0, 100, 10, 90, "%g%%", "FSR 1 RCAS sharpening. 0% bypasses the pass."))
+            g_settings.fsr1_sharpness = (int)amount;
     }
 #endif
 #ifndef __APPLE__  // (Vulkan: nvn/vulkan/textures.c vk_sampler, "Banding")
@@ -692,28 +784,77 @@ static void tab_performance(void) {
 #ifndef __APPLE__  // (Vulkan: runtime/hle/odyssey_120.c, nvn/interp.c)
     opt_section("Frame rate");
     {
-        static const char *fps[] = {"60 FPS", "120 FPS (Experimental)"};
-        opt_choice("Frame rate", &g_settings.frame_rate, fps, 2, FPS_60,
-                   "Experimental 120 FPS draws up to 120 frames per second while gameplay runs at its original 60 Hz. "
-                   "Use a 120 Hz or faster display. 60 FPS matches the Switch. Changes at once.", false);
+        static const char *fps[FPS_COUNT] = {"60 FPS", "90 FPS (Experimental)", "120 FPS (Experimental)"};
+        opt_choice("Frame rate", &g_settings.frame_rate, fps, FPS_COUNT, FPS_60,
+                   "90 and 120 FPS draw up to 90 or 120 frames per second while gameplay runs at its original 60 Hz. "
+                   "Use a display that refreshes at least that fast (90 Hz: Steam Deck OLED). "
+                   "60 FPS matches the Switch and uses the least power. Changes at once.", false);
     }
-    if (g_settings.frame_rate == FPS_120) opt_disable_next();
+    if (g_settings.frame_rate != FPS_60) opt_disable_next();
 #ifdef _WIN32
-    if (vk_dlss_enabled()) opt_disable_next();
+    if (vk_temporal_enabled()) opt_disable_next();
 #endif
     opt_toggle("120 FPS interpolation", &g_settings.frame_interp, false,
                "Available with Frame rate set to 60 FPS and DLSS off. Adds an image between game frames, targeting 120 FPS "
                "on a 120 Hz or faster display. Busy scenes can temporarily fall back to 60 FPS.");
 #endif
+    opt_section("Power");
+    if (opt_action("Battery saver", "",
+                   "Sets lighter settings for handhelds and laptops on battery: 75% internal resolution upscaled with FSR 1, "
+                   "no SMAA, no 120 FPS or interpolation, 4x texture filtering. The game itself still runs at its normal "
+                   "speed. On a Steam Deck, also lower the power limit in the Quick Access menu (Performance > TDP Limit) "
+                   "for the biggest savings. Some changes apply at the next start.")) {
+        settings_battery_saver();
+        settings_save();
+    }
     opt_section("Overlay");
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
-    opt_toggle("Advanced performance overlay", &g_settings.performance_overlay, false,
-               "Shows FPS, frame time, and available hardware information in the top right.");
+    opt_toggle("Performance overlay", &g_settings.performance_overlay, false,
+               "Shows the frame rate and frame times with a graph, GPU / CPU / memory use, temperatures and power where "
+               "your PC reports them, the upscaler and resolution, and Mario's position. Hidden while this menu is open. "
+               "Choose its parts below.");
+    {
+        static const char *const corners[OVERLAY_CORNER_COUNT] = {"Top right", "Top left", "Bottom right", "Bottom left"};
+        static const char *const sizes[3] = {"Small", "Medium", "Large"};
+        if (!g_settings.performance_overlay) opt_disable_next();
+        opt_choice("Overlay position", &g_settings.overlay_corner, corners, OVERLAY_CORNER_COUNT, OVERLAY_TOP_RIGHT,
+                   "The corner of the picture the performance overlay sits in.");
+        if (!g_settings.performance_overlay) opt_disable_next();
+        opt_choice("Overlay size", &g_settings.overlay_size, sizes, 3, 1, "The size of the performance overlay's text.");
+        float opacity = (float)g_settings.overlay_opacity;
+        if (!g_settings.performance_overlay) opt_disable_next();
+        if (opt_slider("Overlay background", &opacity, 0, 100, 10, 80, "%g%%",
+                       "How solid the overlay's background is. 0% shows only the text."))
+            g_settings.overlay_opacity = (int)(opacity + 0.5f);
+        struct { const char *label; bool *on; const char *help; } parts[] = {
+            {"Show GPU", &g_settings.overlay_gpu, "GPU use, temperature, power draw, video memory and clock speed. "
+             "Temperature, power and clock need an NVIDIA card, or Linux with an AMD or Intel one."},
+            {"Show CPU", &g_settings.overlay_cpu, "CPU use, the game's own share of it, and on Linux the CPU's temperature."},
+            {"Show memory", &g_settings.overlay_ram, "The PC's memory in use, and the game's own."},
+            {"Show frame time graph", &g_settings.overlay_graph, "A line of the last frames' times: flat when the game runs evenly, a spike at each hitch."},
+            {"Show hardware names", &g_settings.overlay_hardware, "The names of the graphics card and the processor."},
+            {"Show upscaler and resolution", &g_settings.overlay_render, "The upscaler and anti-aliasing in use, and the game's internal resolution next to its size on screen."},
+            {"Show Mario's position", &g_settings.overlay_position, "Mario's position in the kingdom, in metres. Useful for bug reports."},
+        };
+        for (auto &part : parts) {
+            if (!g_settings.performance_overlay) opt_disable_next();
+            opt_toggle(part.label, part.on, true, part.help);
+        }
+    }
 #ifndef __APPLE__  // (Vulkan: nvn/vulkan/device.c vk_prepare_before_start)
     opt_section("Shaders");
-    opt_toggle("Preload area shaders", &g_settings.shader_preload, true,
-               "Warms shader libraries during area loading to reduce stalls and objects popping in. Uses more memory. "
-               "Applies to areas loaded from now on.");
+    {
+        static const char *const mem[MEMORY_COUNT] = {"Auto", "Normal", "Low"};
+        opt_choice("Memory use", &g_settings.memory, mem, MEMORY_COUNT, MEMORY_AUTO,
+                   "Normal builds the shaders of everything an area loads ahead of time, for fewer stutters (about 9 GB of "
+                   "RAM with an NVIDIA GPU). Low builds each shader the first time it is drawn: a short stutter the first "
+                   "time, about 6.5 GB. Auto picks Low on a PC with less than 12 GB of RAM. The game itself needs about "
+                   "3.5 GB, so 4 GB of RAM is not enough. Takes effect at the next start.", false);
+    }
+    opt_toggle("Preload area shaders", &g_settings.shader_preload, false,
+               "Builds the shaders of everything an area loads right away, to reduce stalls and objects popping in. "
+               "Uses a lot of memory (the graphics driver keeps them), so it stops at a quarter of your RAM or 8 GB. "
+               "Shaders the game has drawn before are built ahead either way. Applies to areas loaded from now on.");
     {
         static const char *wn[] = {"Skip", "Wait"};
         int wi = g_settings.shader_wait;
@@ -856,9 +997,30 @@ static void tab_updates(float scale) {
 }
 
 static void tab_quit(float scale) {
+    static char report[1200];
+    static char previous[1200];
+    static bool checked_previous;
+    static const char *result = "Create file";
+    auto copy_result = []() { int s = diagnostics_copy_status(); return s > 0 ? "Path copied" : s == 0 ? "Copy pending" : "Saved"; };
+    if (!strcmp(result, "Copy pending")) result = copy_result();
     opt_begin("##quit", scale);
     opt_section("Quit");
     if (opt_action("Quit to Desktop", "", "Closes " RT_APP_NAME " after confirmation.")) g_quit_prompt = true;
+    opt_section("Diagnostics");
+    if (opt_action("Copy crash report", result,
+                   "Creates one text file with the saved settings, log, hardware/driver and fault details. Copies its path to paste into the attachment file picker. Includes local paths; nothing is uploaded.")) {
+        settings_save();
+        if (diagnostics_write_report(report, sizeof report))
+            result = diagnostics_copy_path(report) ? copy_result() : "Saved";
+        else result = "Could not save";
+    }
+    if (report[0]) { opt_disable_next(); opt_action("Saved report", "", report); }
+    if (!checked_previous) { diagnostics_last_crash(previous, sizeof previous); checked_previous = true; }
+    if (previous[0] &&
+        opt_action("Copy last crash report", "", "Copies the saved crash report's path, including after restarting the game.")) {
+        if (diagnostics_last_crash(report, sizeof report)) result = diagnostics_copy_path(report) ? copy_result() : "Saved";
+        else { previous[0] = 0; result = "No saved crash"; }
+    }
     opt_end();
 }
 
@@ -903,6 +1065,10 @@ static void tab_about(void) {
     hint("The game's text language, as its own system setting. Applies the next time the game starts.");
     ImGui::Spacing();
     header("Controller");
+    toggle("Motion controls", &g_settings.motion);
+    hint("The controller's gyro and accelerometer for the game's motion moves: shake it to throw Cappy at a target, "
+         "spin him, or tilt where the game asks. Needs a controller with motion sensors (PlayStation, Switch Pro, "
+         "Steam Deck).");
     toggle("Vibration", &g_settings.rumble);
     hint("The controller's rumble, as the game sends it (the Switch's HD rumble on the controller's motors).");
     {
@@ -929,12 +1095,14 @@ static void tab_about(void) {
     toggle("Invert mouse up / down", &g_settings.mouse_invert_y);
     hint("Moving the mouse up turns the camera down instead.");
     {
-        static const char *const names[PROMPTS_COUNT] = {"Auto", "Controller", "Keyboard and mouse"};
+        static const char *const names[PROMPTS_COUNT] = {"Auto", "Controller", "Keyboard and mouse", "Switch", "Xbox",
+                                                         "PlayStation"};
         int i = g_settings.prompts >= 0 && g_settings.prompts < PROMPTS_COUNT ? g_settings.prompts : PROMPTS_AUTO;
         if (choice("Button prompts", &i, names, PROMPTS_COUNT)) g_settings.prompts = i;
     }
-    hint("The game's button icons: Auto shows the keys you bound (and the mouse for the camera) after you use the "
-         "keyboard or mouse, and the controller's buttons after you use a controller.");
+    hint("The game's button icons. Auto switches as you play: the keys you bound (and the mouse for the camera) after "
+         "you use the keyboard or mouse, the controller's own buttons (Xbox, PlayStation or Switch) after you use a "
+         "controller. Controller always shows the connected controller's; Switch, Xbox and PlayStation always those.");
     toggle("Skip controller tips", &g_settings.skip_intro);
     hint("Leaves out the Joy-Con instructions screen's wait before the title screen. Applies at the next start.");
     ImGui::Spacing();
@@ -1179,24 +1347,130 @@ void menu_tabs_draw(float scale, ImFont *font, ImFont *font_big, bool, void (*pr
     g_font = f0, g_font_big = f1;
 }
 
+// ---- the performance overlay: rows of a coloured label and up to three values, the frame time graph, then the
+// hardware's names, the upscaler and resolution, and Mario's position. Each part has its switch (Performance tab).
+#ifdef _WIN32  // (the temporal upscalers are Windows only)
+extern "C" bool vk_temporal_enabled(void);
+extern "C" bool vk_fsr4_available(void);
+#endif
+#define PERF_COLS 18.6f  // the overlay's width in font heights
+
+static void perf_row(const char *label, ImVec4 color, const char *a, const char *b, const char *c) {
+    float em = ImGui::GetFontSize(), x0 = ImGui::GetCursorPosX();
+    ImGui::TextColored(color, "%s", label);
+    if (a) { ImGui::SameLine(x0 + em * 3.3f); ImGui::TextUnformatted(a); }
+    if (b) { ImGui::SameLine(x0 + em * 7.5f); ImGui::TextUnformatted(b); }
+    if (c) { ImGui::SameLine(x0 + em * 12.1f); ImGui::TextUnformatted(c); }
+}
+
+// "43%" / "40 C": the value with its unit, or "-" where this PC doesn't tell
+static const char *perf_num(char *buf, size_t n, int v, const char *unit) {
+    if (v < 0) return "-";
+    snprintf(buf, n, "%d%s", v, unit);
+    return buf;
+}
+
 static void draw_performance(void) {
-    float fps = ImGui::GetIO().Framerate;
-    if (fps > 0) ImGui::Text("%.0f FPS  |  %.2f ms/frame", fps, 1000.0f / fps);
-    else ImGui::TextUnformatted("Measuring frame time");
-#ifndef __APPLE__
-    VulkanOverlayStats stats = vk_overlay_stats();
-    ImGui::Separator();
-    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetFontSize() * 22);
-    if (stats.gpu_name && *stats.gpu_name) ImGui::TextUnformatted(stats.gpu_name);
-    if (stats.gpu_usage >= 0) ImGui::Text("GPU %d%%", stats.gpu_usage);
-    else ImGui::TextUnformatted("GPU usage unavailable");
-    if (stats.vram_budget_mib) {
-        ImGui::SameLine();
-        ImGui::Text("VRAM %.1f / %.1f GiB", stats.vram_mib / 1024.0, stats.vram_budget_mib / 1024.0);
+    const ImVec4 green(0.56f, 0.86f, 0.36f, 1), blue(0.36f, 0.66f, 0.92f, 1), pink(0.82f, 0.52f, 0.72f, 1), white(1, 1, 1, 1);
+    const ImVec4 dim(0.78f, 0.80f, 0.82f, 1);
+    char a[48], b[48], c[48];
+    float em = ImGui::GetFontSize();
+    // frame times of the last 180 presents
+    static float times[180];
+    static int at, filled;
+    float dt = ImGui::GetIO().DeltaTime * 1000.0f;
+    times[at] = dt, at = (at + 1) % 180;
+    if (filled < 180) filled++;
+    float worst = 0, sum = 0, recent = 0;
+    int n_recent = 0;
+    for (int i = 0; i < filled; i++) {
+        float t = times[(at - 1 - i + 360) % 180];
+        if (t > worst) worst = t;
+        sum += t;
+        if (recent < 500.0f) recent += t, n_recent++;  // (the average over the last half second)
     }
-    if (stats.cpu_name && *stats.cpu_name) ImGui::TextUnformatted(stats.cpu_name);
-    if (stats.cpu_usage >= 0) ImGui::Text("CPU %d%%", stats.cpu_usage);
+    float ms = n_recent ? recent / n_recent : 0;
+#ifndef __APPLE__
+    VulkanOverlayStats s = vk_overlay_stats();
+    if (g_settings.overlay_gpu) {
+        char t[16], w[16];
+        perf_row("GPU", green, perf_num(a, sizeof a, s.gpu_usage, "%"), perf_num(t, sizeof t, s.gpu_temp_c, " C"),
+                 perf_num(w, sizeof w, s.gpu_power_w, " W"));
+        if (s.vram_budget_mib) {
+            snprintf(a, sizeof a, "%.2f GB", s.vram_mib / 1024.0);
+            snprintf(b, sizeof b, "/ %.1f GB", s.vram_budget_mib / 1024.0);
+            perf_row("VRAM", green, a, b, s.gpu_clock_mhz > 0 ? perf_num(c, sizeof c, s.gpu_clock_mhz, " MHz") : NULL);
+        }
+    }
+    if (g_settings.overlay_cpu) {
+        char t[16];
+        if (s.game_cpu_usage >= 0) snprintf(c, sizeof c, "game %d%%", s.game_cpu_usage);
+        perf_row("CPU", blue, perf_num(a, sizeof a, s.cpu_usage, "%"), perf_num(t, sizeof t, s.cpu_temp_c, " C"),
+                 s.game_cpu_usage >= 0 ? c : NULL);
+    }
+    if (g_settings.overlay_ram && s.ram_total_mib) {
+        snprintf(a, sizeof a, "%.1f GB", s.ram_used_mib / 1024.0);
+        snprintf(b, sizeof b, "/ %.1f GB", s.ram_total_mib / 1024.0);
+        snprintf(c, sizeof c, "game %.1f GB", s.game_ram_mib / 1024.0);
+        perf_row("RAM", pink, a, b, s.game_ram_mib ? c : NULL);
+    }
+#endif
+    if (ms > 0) {
+        snprintf(a, sizeof a, "%.0f", 1000.0f / ms);
+        snprintf(b, sizeof b, "%.1f ms", ms);
+        snprintf(c, sizeof c, "max %.1f ms", worst);
+        perf_row("FPS", white, a, b, c);
+    } else perf_row("FPS", white, "-", NULL, NULL);
+    if (g_settings.overlay_graph) {
+        // the frame times as a line: flat when every frame takes as long, a spike at a hitch
+        ImGui::Dummy(ImVec2(0, em * 0.25f));
+        ImVec2 p = ImGui::GetCursorScreenPos(), size(em * PERF_COLS, em * 2.2f);
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), IM_COL32(40, 44, 36, 190), em * 0.3f);
+        float top = filled ? sum / filled * 2.0f : 33.4f;
+        if (top < worst * 1.1f) top = worst * 1.1f;
+        if (top < 1) top = 1;
+        ImVec2 pts[180];
+        float pad = em * 0.6f;
+        for (int i = 0; i < filled; i++) {
+            float t = times[(at - filled + i + 360) % 180];
+            pts[i] = ImVec2(p.x + pad + (size.x - 2 * pad) * (filled > 1 ? (float)i / (filled - 1) : 0),
+                            p.y + size.y - pad * 0.5f - (size.y - pad) * (t / top));
+        }
+        if (filled > 1) dl->AddPolyline(pts, filled, IM_COL32(235, 235, 235, 230), 0, em * 0.07f < 1 ? 1 : em * 0.07f);
+        ImGui::Dummy(size);
+        ImGui::Dummy(ImVec2(0, em * 0.15f));
+    } else ImGui::Dummy(ImVec2(em * PERF_COLS, 0));  // (the overlay keeps its width)
+#ifndef __APPLE__
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + em * PERF_COLS);
+    if (g_settings.overlay_hardware) {
+        if (s.gpu_name && *s.gpu_name) ImGui::TextColored(dim, "%s", s.gpu_name);
+        if (s.cpu_name && *s.cpu_name) ImGui::TextColored(dim, "%s", s.cpu_name);
+    }
+    if (g_settings.overlay_render) {
+        const char *up = g_settings.res_mode == RES_MATCH ? "Off" : g_settings.upscaler == UPSCALE_FSR1 ? "FSR 1" : "Bilinear";
+        const char *aa = g_settings.antialias == AA_SMAA ? "SMAA" : "Off";
+#ifdef _WIN32
+        char name[48];
+        if (vk_temporal_enabled()) {
+            static const char *const modes[DLSS_MODE_COUNT] = {"", "Native AA", "Quality", "Balanced", "Performance"};
+            int backend = g_settings.temporal_backend, mode = *settings_temporal_mode();
+            const char *tech = "DLSS";
+            if (backend == TEMPORAL_XESS) tech = "XeSS";
+            else if (backend == TEMPORAL_FSR4) tech = vk_fsr4_available() ? "FSR 4" : "FSR 3.1";
+            else if (backend == TEMPORAL_FSR3) tech = "FSR 3.1";
+            if (mode < 0 || mode >= DLSS_MODE_COUNT) mode = 0;
+            snprintf(name, sizeof name, "%s %s", tech, backend == TEMPORAL_DLSS && mode == DLSS_DLAA ? "DLAA" : modes[mode]);
+            up = name, aa = "Temporal";
+        }
+#endif
+        ImGui::TextColored(dim, "Upscaler: %s | Anti-aliasing: %s", up, aa);
+        if (s.render_w && s.out_w) ImGui::TextColored(dim, "%u x %u -> %u x %u", s.render_w, s.render_h, s.out_w, s.out_h);
+    }
     ImGui::PopTextWrapPos();
+    float pos[3];
+    if (g_settings.overlay_position && odyssey_player_position(pos))  // (in metres: the game's units are centimetres)
+        ImGui::Text("X %.1f  Y %.1f  Z %.1f", pos[0] / 100.0f, pos[1] / 100.0f, pos[2] / 100.0f);
 #endif
 }
 #ifdef __APPLE__
@@ -1261,17 +1535,28 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     } else if (menu_stats_visible() && (!open || !g_settings.performance_overlay)) {
         bool advanced = g_settings.performance_overlay;
         float margin = 16 * scale;
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - margin, margin),
-                                ImGuiCond_Always, ImVec2(1, 0));
-        ImGui::SetNextWindowBgAlpha(advanced ? 0.8f : 0.5f);
-        if (advanced) ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8 * scale, 3 * scale));
+        // the overlay's corner, size and background are the player's choice; the plain FPS counter stays top right
+        int corner = advanced ? g_settings.overlay_corner : OVERLAY_TOP_RIGHT;
+        bool right = corner == OVERLAY_TOP_RIGHT || corner == OVERLAY_BOTTOM_RIGHT;
+        bool bottom = corner == OVERLAY_BOTTOM_RIGHT || corner == OVERLAY_BOTTOM_LEFT;
+        static const float sizes[3] = {0.64f, 0.80f, 1.0f};
+        ImGui::SetNextWindowPos(ImVec2(right ? io.DisplaySize.x - margin : margin, bottom ? io.DisplaySize.y - margin : margin),
+                                ImGuiCond_Always, ImVec2(right ? 1 : 0, bottom ? 1 : 0));
+        ImGui::SetNextWindowBgAlpha(advanced ? g_settings.overlay_opacity * 0.01f : 0.5f);
+        if (advanced) {
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8 * scale, 3 * scale));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16 * scale, 12 * scale));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12 * scale);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.04f, 0.07f, 0.08f, 1));
+        }
         ImGui::Begin("##fps", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
-        ImGui::SetWindowFontScale(advanced ? 0.64f : 1.0f);
+        ImGui::SetWindowFontScale(advanced ? sizes[g_settings.overlay_size >= 0 && g_settings.overlay_size <= 2 ? g_settings.overlay_size : 1] : 1.0f);
         if (advanced) draw_performance();
         else ImGui::Text("%.0f fps", io.Framerate);
         ImGui::End();
-        if (advanced) ImGui::PopStyleVar();
+        if (advanced) { ImGui::PopStyleColor(); ImGui::PopStyleVar(4); }
     }
 
     if (!setup) {  // a new release found at start: a note in the corner for a few seconds (the menu's Updates page has it)

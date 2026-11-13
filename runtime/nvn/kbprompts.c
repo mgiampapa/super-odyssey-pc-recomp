@@ -8,6 +8,10 @@
 // place of the controller's: key caps with the keys bound in the Controls tab, a WASD cluster for the left stick, a
 // mouse for the right one (the mouse camera). Glyphs with no keyboard meaning (Home, Capture, the Joy-Con pictures)
 // stay. Each icon is drawn inside the box the game's own glyph covered, so text around it keeps its spacing.
+// With an Xbox or PlayStation controller (or the setting) the same sheet gets that controller's buttons instead: the
+// face button that plays each Switch button (by the Controls tab's bindings: Switch A is the east button, Xbox B,
+// PlayStation circle), LB / RB / LT / RT or L1 / R1 / L2 / R2, Menu / View or Options / Create. The sticks, the d-pad
+// and the diamond pictures (a button by its place) are the same on every controller and stay.
 #include <SDL3/SDL.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -133,27 +137,43 @@ bool kbprompts_identify(const uint8_t *blocks, uint32_t wb, uint32_t hb) {
 }
 
 // ---------------------------------------------------------------- which icons
+enum { STYLE_GAME = 0, STYLE_KEYBOARD, STYLE_XBOX, STYLE_PLAYSTATION };
 static _Atomic int g_last_kb = -1;  // the device used last: 1 keyboard / mouse, 0 controller, -1 none yet
-static _Atomic bool g_ever_kb;      // the keyboard icons were wanted once (from then on the sheet is looked after)
+static _Atomic bool g_ever;         // icons other than the game's were wanted once (from then on the sheet is looked after)
 void kbprompts_note_device(bool keyboard) {
     g_last_kb = keyboard;
-    if (keyboard && !g_ever_kb) { g_ever_kb = true; LOG("[prompts] keyboard / mouse in use: keyboard icons on\n"); }
+}
+
+static int pad_style(void) {
+    extern int input_pad_family(void);  // runtime/hle/input.c: 1 Xbox, 2 PlayStation, 0 Nintendo / other
+    int f = input_pad_family();
+    return f == 1 ? STYLE_XBOX : f == 2 ? STYLE_PLAYSTATION : STYLE_GAME;
+}
+static int wanted_style(void) {
+    switch (g_settings.prompts) {
+    case PROMPTS_KEYBOARD: return STYLE_KEYBOARD;
+    case PROMPTS_SWITCH: return STYLE_GAME;
+    case PROMPTS_XBOX: return STYLE_XBOX;
+    case PROMPTS_PLAYSTATION: return STYLE_PLAYSTATION;
+    case PROMPTS_CONTROLLER: return pad_style();
+    default: return g_last_kb == 1 ? STYLE_KEYBOARD : pad_style();
+    }
 }
 
 bool kbprompts_active(void) {
-    return g_settings.prompts == PROMPTS_KEYBOARD || (g_settings.prompts == PROMPTS_AUTO && g_ever_kb);
-}
-
-static bool keyboard_wanted(void) {
-    if (g_settings.prompts == PROMPTS_CONTROLLER) return false;
-    if (g_settings.prompts == PROMPTS_KEYBOARD) return true;
-    return g_last_kb == 1;
+    if (g_ever) return true;
+    int st = wanted_style();
+    if (st == STYLE_GAME) return false;
+    g_ever = true;
+    LOG("[prompts] %s icons on\n", st == STYLE_KEYBOARD ? "keyboard / mouse" : st == STYLE_XBOX ? "Xbox" : "PlayStation");
+    return true;
 }
 
 uint32_t kbprompts_generation(void) {
-    uint32_t h = 2166136261u;  // the bindings' signature: a rebind redraws the key caps
+    uint32_t h = 2166136261u;  // the bindings' signature: a rebind redraws the icons
     for (int i = 0; i < BIND_KEY_COUNT; i++) h = (h ^ (uint16_t)g_bind_key[i]) * 16777619u;
-    return (h << 1 | keyboard_wanted()) | 0x80000000u;
+    for (int i = 0; i < BIND_PAD_COUNT; i++) h = (h ^ (uint16_t)bind_prompt_host(i)) * 16777619u;
+    return (h << 2 | (uint32_t)wanted_style()) | 0x80000000u;
 }
 
 // ---------------------------------------------------------------- drawing (a cell's coverage, 0..1, y down)
@@ -392,6 +412,113 @@ static void draw_glyph(Canvas *c, int g, float x0, float y0, float x1, float y1)
     }
 }
 
+// ---------------------------------------------------------------- controller icons (Xbox, PlayStation)
+static bool in_capsule(const float *s, float x, float y) {  // s: ends (x0 y0) (x1 y1), radius
+    float dx = s[2] - s[0], dy = s[3] - s[1], l = dx * dx + dy * dy;
+    float t = l > 0 ? ((x - s[0]) * dx + (y - s[1]) * dy) / l : 0;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    float px = s[0] + t * dx - x, py = s[1] + t * dy - y;
+    return px * px + py * py <= s[4] * s[4];
+}
+static void capsule(Canvas *c, float x0, float y0, float x1, float y1, float r, int mode) {
+    float s[5] = {x0, y0, x1, y1, r};
+    shape(c, fminf(x0, x1) - r, fminf(y0, y1) - r, fmaxf(x0, x1) + r, fmaxf(y0, y1) + r, in_capsule, s, mode);
+}
+static void disc(Canvas *c, float cx, float cy, float r, int mode) { rrect(c, cx - r, cy - r, cx + r, cy + r, r, mode); }
+
+// A face button: a disc with its letter (Xbox) or shape (PlayStation) cut out. host: SDL's south / east / west / north
+static void face_button(Canvas *c, float x0, float y0, float x1, float y1, int host, int style) {
+    float cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, r = fminf(x1 - x0, y1 - y0) / 2;
+    disc(c, cx, cy, r, FILL);
+    if (style == STYLE_XBOX) {
+        static const char *const letters[4] = {"A", "B", "X", "Y"};
+        text(c, letters[host], cx, cy, r * 1.2f, r * 0.95f, CUT);
+        return;
+    }
+    float s = r * 0.5f, w = fmaxf(1.6f, r * 0.13f);  // (the shape's half size and its line)
+    switch (host) {
+    case 0:  // cross
+        capsule(c, cx - s, cy - s, cx + s, cy + s, w, CUT);
+        capsule(c, cx - s, cy + s, cx + s, cy - s, w, CUT);
+        break;
+    case 1:  // circle
+        disc(c, cx, cy, s + w, CUT);
+        disc(c, cx, cy, s - w, FILL);
+        break;
+    case 2:  // square
+        rrect(c, cx - s - w * 0.4f, cy - s - w * 0.4f, cx + s + w * 0.4f, cy + s + w * 0.4f, w * 0.6f, CUT);
+        rrect(c, cx - s + w * 1.6f, cy - s + w * 1.6f, cx + s - w * 1.6f, cy + s - w * 1.6f, 0, FILL);
+        break;
+    default: {  // triangle
+        float top = cy - s * 1.05f, bot = cy + s * 0.75f, half = s * 1.05f;
+        capsule(c, cx, top, cx - half, bot, w, CUT);
+        capsule(c, cx, top, cx + half, bot, w, CUT);
+        capsule(c, cx - half, bot, cx + half, bot, w, CUT);
+    }
+    }
+}
+
+// A shoulder button or trigger: a rounded bar with its name cut out (a trigger: taller, rounded at the top)
+static void shoulder(Canvas *c, float x0, float y0, float x1, float y1, const char *name, bool trigger) {
+    float w = x1 - x0, h = y1 - y0, bh = trigger ? h * 0.82f : h * 0.62f, cy = (y0 + y1) / 2, top = cy - bh / 2;
+    float bw = fminf(w, h * 1.5f), cx = (x0 + x1) / 2;
+    rrect(c, cx - bw / 2, top, cx + bw / 2, top + bh, trigger ? bw * 0.3f : bh * 0.45f, FILL);
+    if (trigger) rrect(c, cx - bw / 2, top + bh * 0.5f, cx + bw / 2, top + bh, bh * 0.12f, FILL);  // (flatter below)
+    text(c, name, cx, cy, bw * 0.8f, bh * 0.5f, CUT);
+}
+
+// Start / select: Xbox Menu (three lines) and View (two windows), PlayStation Options (three lines) and Create (a pill
+// with a dot)
+static void system_button(Canvas *c, float x0, float y0, float x1, float y1, bool start, int style) {
+    float cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, r = fminf(x1 - x0, y1 - y0) / 2;
+    float line = fmaxf(1.5f, r * 0.13f);
+    if (style == STYLE_XBOX) disc(c, cx, cy, r, FILL);
+    else rrect(c, cx - r * 0.62f, cy - r, cx + r * 0.62f, cy + r, r * 0.45f, FILL);
+    float s = style == STYLE_XBOX ? r * 0.48f : r * 0.36f;
+    if (start) {
+        for (int i = -1; i <= 1; i++) rrect(c, cx - s, cy + i * s * 0.62f - line / 2, cx + s, cy + i * s * 0.62f + line / 2, 0, CUT);
+    } else if (style == STYLE_XBOX) {  // View: a window over another
+        rrect(c, cx - s * 0.9f, cy - s * 0.9f, cx + s * 0.4f, cy + s * 0.4f, 0, CUT);
+        rrect(c, cx - s * 0.9f + line, cy - s * 0.9f + line, cx + s * 0.4f - line, cy + s * 0.4f - line, 0, FILL);
+        rrect(c, cx - s * 0.4f, cy - s * 0.4f, cx + s * 0.9f, cy + s * 0.9f, 0, CUT);
+        rrect(c, cx - s * 0.4f + line, cy - s * 0.4f + line, cx + s * 0.9f - line, cy + s * 0.9f - line, 0, FILL);
+    } else {  // Create: an arrow up out of a tray
+        arrow(c, cx, cy - s * 0.55f, s * 0.55f, 0, CUT);
+        rrect(c, cx - line / 2, cy - s * 0.3f, cx + line / 2, cy + s * 0.5f, 0, CUT);
+        rrect(c, cx - s, cy + s * 0.75f - line / 2, cx + s, cy + s * 0.75f + line / 2, 0, CUT);
+    }
+}
+
+// The controller icon for glyph g: false where the game's own stays (the sticks, the d-pad, the diamond pictures)
+static bool draw_pad_glyph(Canvas *c, int g, float x0, float y0, float x1, float y1, int style) {
+    int fam = style == STYLE_XBOX ? 1 : 2, slot;
+    switch (g) {
+    case G_A: slot = BIND_A; break;
+    case G_B: slot = BIND_B; break;
+    case G_X: slot = BIND_X; break;
+    case G_Y: slot = BIND_Y; break;
+    case G_L: slot = BIND_L; break;
+    case G_R: slot = BIND_R; break;
+    case G_ZL: slot = BIND_ZL; break;
+    case G_ZR: slot = BIND_ZR; break;
+    case G_PLUS: slot = BIND_PLUS; break;
+    case G_MINUS: slot = BIND_MINUS; break;
+    default: return false;
+    }
+    int host = bind_prompt_host(slot);
+    if (host < 0) return false;
+    if (host <= 3) face_button(c, x0, y0, x1, y1, host, style);
+    else if (host == SDL_GAMEPAD_BUTTON_START || host == SDL_GAMEPAD_BUTTON_BACK)
+        system_button(c, x0, y0, x1, y1, host == SDL_GAMEPAD_BUTTON_START, style);
+    else {
+        const char *name = bind_pad_label(host, fam);
+        if (!strcmp(name, "LS (press)")) name = "LS";
+        else if (!strcmp(name, "RS (press)")) name = "RS";
+        shoulder(c, x0, y0, x1, y1, name, host == PADB_LTRIGGER || host == PADB_RTRIGGER);
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------- BC4
 static void bc4_decode(const uint8_t *b, uint8_t out[16]) {
     uint8_t p[8] = {b[0], b[1]};
@@ -424,6 +551,7 @@ static uint8_t *g_patched;  // BC4 blocks with the keyboard icons
 static uint32_t g_patched_gen;
 
 static void build(uint32_t gen, uint32_t wb, uint32_t hb) {
+    int style = (int)(gen & 3);
     uint32_t W = wb * 4, H = hb * 4;
     uint8_t *img = malloc((size_t)W * H);
     memcpy(img, g_orig, (size_t)W * H);
@@ -446,10 +574,11 @@ static void build(uint32_t gen, uint32_t wb, uint32_t hb) {
                 }
         if (ix1 < 0) continue;
         memset(c.a, 0, (size_t)sw * sh * sizeof(float));
-        draw_glyph(&c, g, (float)ix0, (float)iy0, (float)ix1 + 1, (float)iy1 + 1);
+        if (style == STYLE_KEYBOARD) draw_glyph(&c, g, (float)ix0, (float)iy0, (float)ix1 + 1, (float)iy1 + 1);
+        else draw_pad_glyph(&c, g, (float)ix0, (float)iy0, (float)ix1 + 1, (float)iy1 + 1, style);
         bool any = false;
         for (uint32_t i = 0; i < sw * sh && !any; i++) any = c.a[i] > 0;
-        if (!any) continue;  // (a glyph with no keyboard meaning keeps the game's)
+        if (!any) continue;  // (a glyph with no keyboard / controller meaning keeps the game's)
         for (uint32_t y = 0; y < sh; y++)
             for (uint32_t x = 0; x < sw; x++) {
                 size_t a = (size_t)(H - 1 - (y0 + y)) * W + x0 + x;
@@ -482,7 +611,7 @@ static void build(uint32_t gen, uint32_t wb, uint32_t hb) {
         }
     free(img);
     g_patched_gen = gen;
-    LOG("[prompts] keyboard icons drawn (%d)\n", drawn);
+    LOG("[prompts] %s icons drawn (%d)\n", style == STYLE_KEYBOARD ? "keyboard" : style == STYLE_XBOX ? "Xbox" : "PlayStation", drawn);
 }
 
 void kbprompts_apply(uint32_t lv, uint8_t *blocks, uint32_t wb, uint32_t hb) {
@@ -497,7 +626,7 @@ void kbprompts_apply(uint32_t lv, uint8_t *blocks, uint32_t wb, uint32_t hb) {
             }
     }
     uint32_t gen = kbprompts_generation();
-    if (!(gen & 1)) return;  // controller: the game's icons, as uploaded
+    if (!(gen & 3)) return;  // the game's icons, as uploaded
     if (!g_patched || g_patched_gen != gen) build(gen, wb, hb);
     memcpy(blocks, g_patched, (size_t)wb * hb * 8);
 }

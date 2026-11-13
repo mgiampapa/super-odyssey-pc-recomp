@@ -86,6 +86,7 @@ typedef struct TexBackend {
     uint32_t width, height, depth, layers, levels, samples;
     VkImageAspectFlags aspect;
     bool gpu_owned, uploaded, dynamic, storage;
+    bool paint_cpu_pending; // explicit CPU edits must reach the image even if its next use is a render target
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     bool scalable, presented;

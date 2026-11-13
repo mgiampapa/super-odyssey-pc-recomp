@@ -6,9 +6,10 @@
 //   1. ODYSSEY_DATA_ROOT (tests, scratch installs)
 //   2. dev / portable mode: the starting directory has extracted/ (a source checkout: `./build/SuperOdysseyRecomp`, the
 //      test scripts), or the executable's parent has (build/SuperOdysseyRecomp.exe started from Explorer or a shortcut)
-//   3. macOS: ~/Library/Application Support/io.github.powermoonrecomp (the .app bundle itself is never written to)
+//   3. the folder chosen in the installer ("Install the game to", DATA_FOLDER_FILE: Windows, Linux), else
+//      macOS: ~/Library/Application Support/io.github.powermoonrecomp (the .app bundle itself is never written to)
 //      Windows: the folder of the .exe (portable, no installer); refuses to start, with a message, if not writable
-//      Linux: $XDG_DATA_HOME/power-moon-recomp (~/.local/share/power-moon-recomp)
+//      Linux: $XDG_DATA_HOME/super-odyssey-pc-recomp (~/.local/share/super-odyssey-pc-recomp)
 //
 // Resources: files that ship with the app (helper programs, the window icon) - next to the executable (the
 // Windows folder, the .app's Contents/MacOS), in the .app's Contents/Resources, or in the source tree.
@@ -22,11 +23,13 @@ extern "C" {
 
 #define RT_APP_NAME "Super Odyssey PC Recomp"  // (window title, message boxes)
 #define RT_BUNDLE_ID "io.github.powermoonrecomp"
+#define RT_LINUX_DIR "super-odyssey-pc-recomp"  // Linux: the data folder's and the settings folder's name
 
 void rt_paths_init(void);         // first thing in main(), after plat_init
 const char *rt_data_root(void);   // absolute
-// Windows: the installer's "Install to": the data root becomes dir (made if needed; the working directory too) and is
-// remembered in data-folder.txt next to the exe (removed again for the exe's own folder). false: not usable.
+// The installer's "Install the game to": the data root becomes dir (made if needed; the working directory too) and is
+// remembered in data-folder.txt - Windows next to the exe (removed again for the exe's own folder), Linux in
+// ~/.config/super-odyssey-pc-recomp (an SD card, another drive). false: not usable.
 #define DATA_FOLDER_FILE "data-folder.txt"
 bool rt_set_data_root(const char *dir);
 bool rt_dev_mode(void);           // dev / portable mode (rule 2 above): e.g. a source checkout

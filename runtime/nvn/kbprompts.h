@@ -9,6 +9,7 @@
 extern "C" {
 #endif
 
+// (and the Xbox / PlayStation controller icons, drawn the same way)
 // The keyboard icons have been wanted at all this run (the keyboard / mouse used, or the setting): until then nothing
 // here runs - no texture is looked at or uploaded again - so a controller player's game is as it was without them
 bool kbprompts_active(void);

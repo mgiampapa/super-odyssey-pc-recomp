@@ -17,6 +17,7 @@
 #include "../settings.h"
 #include "nvn.h"
 #include "output_scale.h"
+#include "linear_texture.h"
 
 #define MAX_TEX 16384.0
 
@@ -31,7 +32,7 @@
 bool output_scale_texture(const NvnTexture *t) {
     static int off = -1;
     if (off < 0) off = getenv("ODYSSEY_NO_SCALE") != NULL;
-    if (off || (t->target != 1 && t->target != 4) || t->samples > 1 || (t->flags & (2 | 4 | 0x10))) return false;
+    if (off || (t->target != 1 && t->target != 4) || t->samples > 1 || (t->flags & (2 | 4)) || nvn_flags_linear(t->flags)) return false;
     if (!t->layout.fmt || t->layout.fmt->bw != 1 || t->width < 8 || t->height < 4) return false;
     float a = (float)t->width / (float)t->height;
     return a > 1.70f && a < 1.82f;  // 16:9, within the rounding of the small halves (12x7: 1.71)

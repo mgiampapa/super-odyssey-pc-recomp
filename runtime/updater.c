@@ -1,5 +1,9 @@
-// Updates from GitHub releases (runtime/updater.h). Windows: WinHTTP for the API and the download, CNG for the
-// SHA-256 GitHub lists for each release file, the system's tar.exe to unpack the zip. Other systems: not offered.
+// Updates from GitHub releases (runtime/updater.h). The check is shared; the download differs:
+// - Windows: WinHTTP, CNG for the SHA-256 GitHub lists for each release file, the system's tar.exe to unpack the zip,
+//   the program's files replaced in its folder.
+// - Linux: the system's curl (SteamOS and every desktop distribution have it), the release's AppImage downloaded next to
+//   the running one and renamed over it (Linux lets a running program's file be replaced), SHA-256 from nxcrypto.
+// - macOS: not offered.
 #include "updater.h"
 
 #include <pthread.h>
@@ -14,7 +18,8 @@
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static UpdStatus g_st = {.state = UPD_IDLE};
-static char g_zip_url[1024], g_zip_sha[65];  // the release's Windows zip and its SHA-256 (hex; "" if GitHub gave none)
+static char g_zip_url[1024], g_zip_sha[65];  // the release's download for this OS and its SHA-256 (hex; "" if none given)
+__attribute__((unused)) static uint64_t g_zip_size;  // its size (0: unknown; Linux's progress - Windows asks the server)
 static volatile int g_busy;                  // a check or an install is running
 
 const char *updater_repo(void) {
@@ -180,7 +185,95 @@ out:
     free(wurl);
     return status;
 }
+static int fetch_json(const char *url, char **body, size_t *len) { return http_get(url, NULL, NULL, body, len, NULL); }
+#define ASSET_SUFFIX "-windows.zip"
+#define DOWNLOAD_NAME "Windows download"
 
+#elif defined(__linux__)
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "nxcrypto.h"
+extern char **environ;
+
+#if defined(__aarch64__)
+#define ASSET_SUFFIX "-linux-aarch64.AppImage"
+#else
+#define ASSET_SUFFIX "-linux-x86_64.AppImage"
+#endif
+#define DOWNLOAD_NAME "Linux download"
+
+// GET url into the file out with the system's curl (HTTPS only, redirects followed: GitHub's release files live on
+// its download host). total (may be 0): the expected size, for the progress. HTTP status, or -1 (no curl, no network).
+static int curl_get(const char *url, const char *out, bool api, uint64_t total) {
+    if (strncmp(url, "https://", 8)) return -1;
+    int pfd[2];
+    if (pipe(pfd)) return -1;
+    const char *argv[24];
+    int n = 0;
+    argv[n++] = "curl", argv[n++] = "-sSL", argv[n++] = "--proto", argv[n++] = "=https", argv[n++] = "--proto-redir";
+    argv[n++] = "=https", argv[n++] = "--connect-timeout", argv[n++] = "15", argv[n++] = "--max-time";
+    argv[n++] = api ? "30" : "3600", argv[n++] = "-A", argv[n++] = "SuperOdysseyRecomp-Updater";  // (nothing about the player)
+    if (api) argv[n++] = "-H", argv[n++] = "Accept: application/vnd.github+json";
+    argv[n++] = "-o", argv[n++] = out, argv[n++] = "-w", argv[n++] = "%{http_code}", argv[n++] = "--", argv[n++] = url;
+    argv[n] = NULL;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, pfd[1], 1);
+    posix_spawn_file_actions_addclose(&fa, pfd[0]);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    pid_t pid;
+    int err = posix_spawnp(&pid, "curl", &fa, NULL, (char *const *)argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(pfd[1]);
+    if (err) { close(pfd[0]); LOG("[update] curl couldn't be started (%s)\n", strerror(err)); return -1; }
+    int status = 0;
+    for (;;) {
+        pid_t w = waitpid(pid, &status, WNOHANG);
+        if (w == pid || (w < 0 && errno != EINTR)) break;
+        struct stat st;
+        if (total && stat(out, &st) == 0) {
+            pthread_mutex_lock(&g_lock);
+            g_st.progress = (float)((double)st.st_size / (double)total) * 0.95f;
+            pthread_mutex_unlock(&g_lock);
+        }
+        struct timespec ts = {0, 200 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    char code[8] = "";
+    ssize_t r = read(pfd[0], code, sizeof code - 1);
+    close(pfd[0]);
+    code[r > 0 ? r : 0] = 0;
+    int http = atoi(code);
+    return http > 0 ? http : -1;
+}
+
+static int fetch_json(const char *url, char **body, size_t *len) {
+    *body = NULL, *len = 0;
+    const char *tmp = "cache/update-check.json";  // (the data root is the working directory)
+    mkdir("cache", 0755);
+    int st = curl_get(url, tmp, true, 0);
+    FILE *f = fopen(tmp, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n > 0 && n < (8 << 20) && (*body = malloc((size_t)n + 1)) && fread(*body, 1, (size_t)n, f) == (size_t)n)
+            (*body)[n] = 0, *len = (size_t)n;
+        fclose(f);
+    }
+    remove(tmp);
+    return st;
+}
+#endif
+
+#if defined(_WIN32) || defined(__linux__)
 // ---- check: GET /repos/<repo>/releases/latest (the newest release that isn't a draft or a pre-release)
 static void *check_thread(void *arg) {
     (void)arg;
@@ -199,7 +292,7 @@ static void *check_thread(void *arg) {
     }
     snprintf(url, sizeof url, "https://api.github.com/repos/%s/releases/latest", updater_repo());
     LOG("[update] checking %s\n", url);
-    int st = http_get(url, NULL, NULL, &body, &len, NULL);
+    int st = fetch_json(url, &body, &len);
     LOG("[update] GitHub answered %d (%zu bytes)\n", st, len);
     if (st != 200 || !body) {
         char e[160];
@@ -215,15 +308,17 @@ static void *check_thread(void *arg) {
     char tag[64], page[512];
     json_str(body, body + len, "tag_name", tag, sizeof tag);
     json_str(body, body + len, "html_url", page, sizeof page);
-    // the release's files: the one whose download ends in -windows.zip, and its digest (in the same file entry, before
-    // its download URL: GitHub's order - "digest" comes with "size", "browser_download_url" last)
+    // the release's files: the one whose download ends in ASSET_SUFFIX (this OS's), its size and digest (in the same file
+    // entry, before its download URL: GitHub's order - "size" and "digest" first, "browser_download_url" last)
     char zip[1024] = "", sha[80] = "";
+    uint64_t size = 0;
     const char *end = body + len;
+    size_t sl = strlen(ASSET_SUFFIX);
     for (const char *p = strstr(body, "\"browser_download_url\""); p; p = strstr(p + 1, "\"browser_download_url\"")) {
         char u[1024];
         json_str(p, end, "browser_download_url", u, sizeof u);
         size_t ul = strlen(u);
-        if (ul < 12 || !same_ascii(u + ul - 12, "-windows.zip")) continue;
+        if (ul < sl || !same_ascii(u + ul - sl, ASSET_SUFFIX)) continue;
         snprintf(zip, sizeof zip, "%s", u);
         // this file's entry: from the "url" of its own (".../releases/assets/<id>") on
         const char *start = p;
@@ -231,6 +326,11 @@ static void *check_thread(void *arg) {
             if (!memcmp(q, "/releases/assets/", 17)) { start = q; break; }
         char d[96];
         if (json_str(start, p, "digest", d, sizeof d) && !strncmp(d, "sha256:", 7) && strlen(d + 7) == 64) snprintf(sha, sizeof sha, "%s", d + 7);
+        const char *sz = strstr(start, "\"size\"");  // (a number: by hand)
+        if (sz && sz < p) {
+            for (sz += 6; sz < p && (*sz == ' ' || *sz == ':'); sz++) {}
+            for (; sz < p && *sz >= '0' && *sz <= '9'; sz++) size = size * 10 + (uint64_t)(*sz - '0');
+        }
         break;
     }
     free(body);
@@ -239,12 +339,13 @@ static void *check_thread(void *arg) {
     snprintf(g_st.page, sizeof g_st.page, "%s", page);
     snprintf(g_zip_url, sizeof g_zip_url, "%s", zip);
     snprintf(g_zip_sha, sizeof g_zip_sha, "%s", sha);
+    g_zip_size = size;
     pthread_mutex_unlock(&g_lock);
     if (!tag[0]) set_state(UPD_FAILED, "The release list didn't make sense.");
     else if (!newer(tag, APP_VERSION)) set_state(UPD_LATEST, NULL);
-    else if (!zip[0]) set_state(UPD_FAILED, "The newest release has no Windows download yet.");
+    else if (!zip[0]) set_state(UPD_FAILED, "The newest release has no " DOWNLOAD_NAME " yet.");
     else set_state(UPD_AVAILABLE, NULL);
-    LOG("[update] newest release %s (this is %s)%s\n", tag[0] ? tag : "?", APP_VERSION, zip[0] ? "" : ", no Windows zip");
+    LOG("[update] newest release %s (this is %s)%s\n", tag[0] ? tag : "?", APP_VERSION, zip[0] ? "" : ", no " DOWNLOAD_NAME);
     g_busy = 0;
     return NULL;
 }
@@ -261,7 +362,9 @@ void updater_check(void) {
 void updater_auto_check(void) {
     if (g_settings.check_updates && !getenv("ODYSSEY_NO_UPDATE_CHECK")) updater_check();
 }
+#endif
 
+#ifdef _WIN32
 // ---- install
 typedef struct { HANDLE f; BCRYPT_HASH_HANDLE h; } Dl;
 static bool dl_sink(void *ctx, const void *data, DWORD n) {
@@ -535,7 +638,131 @@ void updater_startup(void) {
     if (left) MoveFileExW(tmp, list, MOVEFILE_REPLACE_EXISTING);
 }
 
-#else  // macOS, Linux: updates come with the platform's own download for now
+#elif defined(__linux__)
+// ---- install (Linux): the AppImage the game runs from ($APPIMAGE, set by the AppImage runtime) replaced by the new one
+static void *install_thread(void *arg) {
+    (void)arg;
+    char url[1024], sha[65], img[1024], part[1100];
+    uint64_t size;
+    pthread_mutex_lock(&g_lock);
+    snprintf(url, sizeof url, "%s", g_zip_url);
+    snprintf(sha, sizeof sha, "%s", g_zip_sha);
+    size = g_zip_size;
+    g_st.progress = 0;
+    pthread_mutex_unlock(&g_lock);
+    const char *ai = getenv("APPIMAGE");
+    if (!ai || *ai != '/') {
+        set_state(UPD_FAILED, "Only the AppImage can update itself. Download the new version from the project page.");
+        g_busy = 0;
+        return NULL;
+    }
+    snprintf(img, sizeof img, "%s", ai);
+    snprintf(part, sizeof part, "%s.download", img);  // (next to it: the rename below stays on one drive)
+    remove(part);
+    int st;
+    const char *test = getenv("ODYSSEY_UPDATE_TEST_ZIP");  // (test) a local file instead of the download
+    if (test) {
+        FILE *in = fopen(test, "rb"), *o = in ? fopen(part, "wb") : NULL;
+        static char tbuf[65536];
+        st = in && o ? 200 : -1;
+        for (size_t k; st == 200 && (k = fread(tbuf, 1, sizeof tbuf, in)) > 0;)
+            if (fwrite(tbuf, 1, k, o) != k) st = -2;
+        if (in) fclose(in);
+        if (o && fclose(o)) st = -2;
+    } else {
+        LOG("[update] downloading %s\n", url);
+        st = curl_get(url, part, false, size);
+    }
+    if (st != 200) {
+        remove(part);
+        set_state(UPD_FAILED, st < 0 ? "The download didn't work (is curl installed, and the internet reachable?)."
+                                     : "The download failed. Try again later.");
+        g_busy = 0;
+        return NULL;
+    }
+    // the file is exactly the one GitHub lists for the release
+    FILE *f = fopen(part, "rb");
+    long n = -1;
+    char *data = NULL;
+    if (f && !fseek(f, 0, SEEK_END) && (n = ftell(f)) > 0 && !fseek(f, 0, SEEK_SET) && (data = malloc((size_t)n)) &&
+        fread(data, 1, (size_t)n, f) != (size_t)n)
+        n = -1;
+    if (f) fclose(f);
+    bool good = n > 1024 && data && !memcmp(data + 1, "ELF", 3);  // (an AppImage is an ELF program)
+    if (good && sha[0]) {
+        unsigned char h[32];
+        char hex[65];
+        nx_sha256(data, (size_t)n, h);
+        for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", h[i]);
+        good = same_ascii(hex, sha);
+        if (good) LOG("[update] SHA-256 matches the release's\n");
+    }
+    free(data);
+    if (!good) {
+        remove(part);
+        set_state(UPD_FAILED, "The download was damaged (its checksum doesn't match). Try again.");
+        g_busy = 0;
+        return NULL;
+    }
+    if (chmod(part, 0755) || rename(part, img)) {
+        remove(part);
+        set_state(UPD_FAILED, "Couldn't replace the AppImage (is its folder writable?). Nothing was changed.");
+        g_busy = 0;
+        return NULL;
+    }
+    LOG("[update] installed: %s\n", img);
+    pthread_mutex_lock(&g_lock);
+    g_st.progress = 1;
+    pthread_mutex_unlock(&g_lock);
+    set_state(UPD_READY, NULL);
+    g_busy = 0;
+    if (getenv("ODYSSEY_UPDATE_TEST_AUTO")) updater_restart();
+    return NULL;
+}
+
+void updater_install(void) {
+    UpdStatus s;
+    updater_status(&s);
+    if (s.state != UPD_AVAILABLE && s.state != UPD_FAILED) return;
+    if (!g_zip_url[0] || g_busy) return;
+    g_busy = 1;
+    set_state(UPD_DOWNLOADING, NULL);
+    pthread_t t;
+    if (pthread_create(&t, NULL, install_thread, NULL)) { g_busy = 0; set_state(UPD_FAILED, "Couldn't start the download."); return; }
+    pthread_detach(t);
+}
+
+// The new AppImage, told to wait for this process to end (updater_startup), then this one ends (settings saved)
+void updater_restart(void) {
+    const char *ai = getenv("APPIMAGE");
+    if (!ai || *ai != '/') return;
+    char pid[32];
+    snprintf(pid, sizeof pid, "%d", (int)getpid());
+    setenv("ODYSSEY_WAIT_PID", pid, 1);
+    unsetenv("ODYSSEY_UPDATE_TEST_ZIP");  // (a test's update happens once)
+    unsetenv("ODYSSEY_UPDATE_TEST_AUTO");
+    char *const argv[] = {(char *)ai, NULL};
+    pid_t child;
+    int err = posix_spawn(&child, ai, NULL, NULL, argv, environ);
+    unsetenv("ODYSSEY_WAIT_PID");
+    if (err) { set_state(UPD_FAILED, "Couldn't start the new version. Start the game again yourself."); return; }
+    LOG("[update] restarting\n");
+    settings_save();
+    plat_terminate();
+}
+
+void updater_startup(void) {
+    const char *w = getenv("ODYSSEY_WAIT_PID");
+    if (!w || !*w) return;
+    pid_t old = (pid_t)atoi(w);  // a restart after an update: the old process ends first
+    for (int i = 0; i < 300 && old > 1 && kill(old, 0) == 0; i++) {
+        struct timespec ts = {0, 100 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    unsetenv("ODYSSEY_WAIT_PID");
+}
+
+#else  // macOS: updates come with the platform's own download for now
 void updater_startup(void) {}
 void updater_auto_check(void) {}
 void updater_check(void) {}

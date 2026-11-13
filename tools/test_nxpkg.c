@@ -2,10 +2,16 @@
 // Writes <outdir>/exefs/*, <outdir>/romfs.bin and <outdir>/romfs/MovieData; compare with the vendored Python extractors.
 // With an update: its ExeFS to <outdir>/exefs-update and the patched RomFS (BKTR over the base) to <outdir>/romfs-update.bin
 // instead of the base RomFS - all six hash levels of the result checked against the update's own master hash.
+// Build: cc -O2 -Iruntime tools/test_nxpkg.c runtime/nxpkg.c runtime/nxcrypto.c -o test_nxpkg
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
-#include <windows.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#define make_dir(p) mkdir(p)
+#else
+#define make_dir(p) mkdir(p, 0755)
+#endif
 
 #include "nxpkg.h"
 
@@ -42,7 +48,7 @@ int main(int argc, char **argv) {
     nxpkg_close(p);
     char movies[1100];
     snprintf(movies, sizeof movies, "%s/romfs", argv[3]);
-    CreateDirectoryA(movies, NULL);
+    make_dir(movies);
     snprintf(movies, sizeof movies, "%s/romfs/MovieData", argv[3]);
     if (!romfs_image_extract_dir(path, "MovieData", movies, why, sizeof why)) { fprintf(stderr, "movies: %s\n", why); return 1; }
     fprintf(stderr, "ok in %.0f s\n", (double)(clock() - t0) / CLOCKS_PER_SEC);

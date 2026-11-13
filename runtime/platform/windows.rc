@@ -6,8 +6,8 @@
 
 // What Explorer's properties and the Task Manager show
 1 VERSIONINFO
-FILEVERSION 0, 1, 1, 0
-PRODUCTVERSION 0, 1, 1, 0
+FILEVERSION 0, 2, 0, 0
+PRODUCTVERSION 0, 2, 0, 0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -19,8 +19,8 @@ BEGIN
             VALUE "FileDescription", "Super Odyssey PC Recomp"
             VALUE "ProductName", "Super Odyssey PC Recomp"
             VALUE "InternalName", "SuperOdysseyRecomp"
-            VALUE "FileVersion", "0.1.1"
-            VALUE "ProductVersion", "0.1.1"
+            VALUE "FileVersion", "0.2.8"
+            VALUE "ProductVersion", "0.2.8"
             VALUE "OriginalFilename", "SuperOdysseyRecomp.exe"
             VALUE "LegalCopyright", "MIT License. Not affiliated with Nintendo."
         END

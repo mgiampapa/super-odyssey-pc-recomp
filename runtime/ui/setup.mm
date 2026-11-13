@@ -788,6 +788,9 @@ bool setup_run(const char *root) {
             SDL_Delay(16);
         }
 #endif
+        // While it works, about 15 pictures a second are plenty for a progress bar: drawn at the display's rate the
+        // page took most of a core the game code's compile could use (a Steam Deck has four).
+        if (busy) SDL_Delay(50);
     }
     menu_setup_mode(false);
     return true;

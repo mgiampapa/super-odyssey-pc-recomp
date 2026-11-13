@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Super Odyssey PC Recomp
+Comment=Super Mario Odyssey, recompiled for PC (bring your own game)
+Exec=SuperOdysseyRecomp
+Icon=superodysseyrecomp
+Categories=Game;
+Terminal=false

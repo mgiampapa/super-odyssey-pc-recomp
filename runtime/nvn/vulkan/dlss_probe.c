@@ -1,4 +1,6 @@
 #include "dlss_probe.h"
+#include "fsr3_sdk.h"
+#include "xess_sdk.h"
 
 #ifdef _WIN32
 #include <math.h>
@@ -37,16 +39,30 @@ static struct {
     unsigned device_count;
 } ngx;
 static atomic_bool available;
-static int mode_at_start, preset_at_start;
+static bool forced_off;
 
-bool vk_dlss_enabled(void) {
-    return g_settings.dlss_mode != DLSS_OFF && atomic_load_explicit(&available, memory_order_relaxed);
+static int temporal_mode(void) {
+    return *settings_temporal_mode();
 }
 
-double vk_dlss_scale(void) {
-    if (!vk_dlss_enabled()) return 0;
+bool vk_temporal_enabled(void) {
+    if (g_settings.temporal_backend == TEMPORAL_FSR3)
+        return g_settings.fsr3_mode != DLSS_OFF && vk_fsr3_available();
+    if (g_settings.temporal_backend == TEMPORAL_FSR4)
+        return g_settings.fsr4_mode != DLSS_OFF && (vk_fsr4_available() || vk_fsr3_available());
+    if (g_settings.temporal_backend == TEMPORAL_XESS)
+        return g_settings.xess_mode != DLSS_OFF && vk_xess_available();
+    return !forced_off && g_settings.dlss_mode != DLSS_OFF && atomic_load_explicit(&available, memory_order_relaxed);
+}
+
+double vk_temporal_scale(void) {
+    if (!vk_temporal_enabled()) return 0;
     static const double scales[DLSS_MODE_COUNT] = {0, 1, 2.0 / 3.0, 1.0 / 1.7, 0.5};
-    return scales[mode_at_start];
+    if (g_settings.temporal_backend == TEMPORAL_XESS) {
+        static const double xess_scales[DLSS_MODE_COUNT] = {0, 1, 1.0/1.7, 0.5, 1.0/2.3};
+        return xess_scales[temporal_mode()];
+    }
+    return scales[temporal_mode()];
 }
 
 static void close_ngx(void) {
@@ -75,16 +91,12 @@ static bool add_extensions(const VkExtensionProperties *have, uint32_t available
 }
 
 void vk_dlss_probe_instance(const char **ext, uint32_t *count, uint32_t capacity) {
-    // ODYSSEY_DLSS_PROBE=1 checks driver/model support without changing any rendering.
-    const char *on = getenv("ODYSSEY_DLSS_PROBE");
+    // Discover the optional driver path at start, including when the selected mode is Off.
     const char *override = getenv("ODYSSEY_DLSS");  // tests can disable the driver path
-    mode_at_start = g_settings.dlss_mode;
-    if (override && !strcmp(override, "0")) mode_at_start = DLSS_OFF;
-    preset_at_start = g_settings.dlss_preset;
-    if (mode_at_start == DLSS_OFF && (!on || strcmp(on, "1"))) {
-        LOG("[dlss] Off: using the game's regular output path\n");
-        return;
-    }
+    forced_off = override && !strcmp(override, "0");
+    if (forced_off) return;
+    // Probe capability even when initially Off, so enabling it in the menu can
+    // use the Vulkan extensions already enabled on this device.
     wchar_t path[1024];
     DWORD bytes = sizeof path;
     if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", L"FullPath",
@@ -161,7 +173,7 @@ void vk_dlss_probe_run(void) {
             }
             LOG("[dlss] NGX Super Resolution capability: %s (query %08x)\n",
                 r == 1 && supported ? "available" : "unavailable", r);
-            if (mode_at_start != DLSS_OFF && r == 1 && supported && ngx.allocate && ngx.create && ngx.evaluate && ngx.release) {
+            if (r == 1 && supported && ngx.allocate && ngx.create && ngx.evaluate && ngx.release) {
                 VkPhysicalDeviceFeatures features;
                 vkGetPhysicalDeviceFeatures(g_vk.phys, &features);
                 if (features.shaderStorageImageExtendedFormats) {
@@ -189,16 +201,49 @@ typedef struct { VkImage image; VkImageView view; VmaAllocation memory; } DlssIm
 static struct {
     DlssCamera camera, scene, previous;
     bool camera_ready, scene_ready, history;
-    VkImage source_depth, previous_depth;
+    VkImage source_depth, previous_depth, jitter_depth;
     uint64_t frame, last_eval, last_eval_ns, eval_count, input_seq, output_seq;
     DlssImage depth, motion, output;
     uint32_t w, h, ow, oh;
+    uint64_t jitter_frame;
+    float jitter[2], scene_jitter[2]; // raster displacement in input pixels, positive right/down
     VkDescriptorSetLayout motion_set;
     VkPipelineLayout motion_layout;
     VkPipeline motion_pipeline;
     NgxParameters *parameters;
     NgxFeature *feature;
+    int feature_mode, feature_preset, feature_backend;
+    bool feature_ml;
 } dlss;
+
+static float halton(unsigned index, unsigned base) {
+    float value = 0, weight = 1;
+    while (index) { weight /= base; value += weight * (index % base); index /= base; }
+    return value;
+}
+
+float vk_dlss_surface_lod_bias(const TexBackend *depth) {
+    if (!vk_temporal_enabled() || !depth || depth->image != dlss.source_depth || !dlss.ow || !dlss.w) return 0;
+    // Choose texture detail for the reconstructed pixel size, rather than the
+    // coarser input pixel size. DLAA and non-upscaled output need no adjustment.
+    return dlss.w < dlss.ow ? log2f((float)dlss.w / dlss.ow) : 0;
+}
+
+void vk_dlss_viewport_jitter(const TexBackend *depth, uint64_t frame, float offset[2]) {
+    offset[0] = offset[1] = 0;
+    // Learn the exact main-scene depth image from the bloom input, rather than
+    // jittering every depth target (which would also move shadow maps and UI).
+    if (!vk_temporal_enabled() || !depth || depth->image != dlss.source_depth ||
+        depth->width != dlss.w || depth->height != dlss.h || !dlss.camera_ready) return;
+    double scale = vk_temporal_scale();
+    if (!(scale > 0 && scale <= 1)) return; // Off can be selected between the readiness and scale checks
+    unsigned phases = (unsigned)ceil(8.0 / (scale * scale));
+    unsigned sample = (unsigned)(frame % phases) + 1;
+    dlss.jitter_frame = frame;
+    dlss.jitter_depth = depth->image;
+    offset[0] = dlss.jitter[0] = halton(sample, 2) - 0.5f;
+    offset[1] = dlss.jitter[1] = halton(sample, 3) - 0.5f;
+}
 
 // ODYSSEY_DLSS_TIMING=1: timestamp the motion pass and DLSS together without waiting for a frame.
 #define DLSS_TIMING_SLOTS 8
@@ -238,6 +283,8 @@ static int timing_begin(VkCommandBuffer cb, uint64_t frame) {
 }
 
 void vk_dlss_set_camera(const DlssCamera *camera) {
+    static bool logged;
+    if (!logged && getenv("ODYSSEY_DLSS_HISTORY_TRACE")) { LOG("[dlss-history] first camera received\n"); logged = true; }
     dlss.camera = *camera;
     dlss.camera_ready = true;
 }
@@ -282,6 +329,8 @@ static void destroy_image(DlssImage *img) {
 static bool reset_output(void) {
     if (dlss.output_seq >= vk_pending_seq()) return false;
     if (dlss.output_seq) vk_wait_seq(dlss.output_seq);
+    vk_fsr3_release();
+    vk_xess_release();
     if (dlss.feature) ngx.release(dlss.feature);
     destroy_image(&dlss.output);
     dlss.feature = NULL;
@@ -292,7 +341,7 @@ static bool reset_output(void) {
 }
 
 void vk_dlss_capture_depth(const TexBackend *depth, uint64_t frame) {
-    if (!vk_dlss_enabled() || !dlss.camera_ready || (dlss.scene_ready && dlss.frame == frame) ||
+    if (!vk_temporal_enabled() || !dlss.camera_ready || (dlss.scene_ready && dlss.frame == frame) ||
         depth->width < 640 || depth->height < 360 || depth->samples != 1 || depth->layers != 1) return;
     vk_end_pass();
     if (dlss.w && (dlss.w != depth->width || dlss.h != depth->height)) {
@@ -315,6 +364,12 @@ void vk_dlss_capture_depth(const TexBackend *depth, uint64_t frame) {
     vkCmdCopyImage(cb, depth->image, VK_IMAGE_LAYOUT_GENERAL, dlss.depth.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     dlss.input_seq = vk_pending_seq();
     dlss.source_depth = depth->image;
+    bool jittered = dlss.jitter_frame == frame && dlss.jitter_depth == depth->image;
+    dlss.scene_jitter[0] = jittered ? dlss.jitter[0] : 0;
+    dlss.scene_jitter[1] = jittered ? dlss.jitter[1] : 0;
+    if (getenv("ODYSSEY_DLSS_HISTORY_TRACE") && frame % 120 == 0)
+        LOG("[dlss-jitter] frame %llu raster %.4f %.4f input %ux%u\n",
+            (unsigned long long)frame, dlss.scene_jitter[0], dlss.scene_jitter[1], depth->width, depth->height);
     dlss.scene = dlss.camera;
     dlss.frame = frame;
     dlss.scene_ready = true;
@@ -369,12 +424,13 @@ static bool motion_init(VkCommandBuffer cb) {
         "layout(local_size_x=8, local_size_y=8) in;\n"
         "layout(binding=0) uniform sampler2D depth;\n"
         "layout(binding=1, rg16f) uniform writeonly image2D motion;\n"
-        "layout(push_constant) uniform Params { mat4 previousClip; } pc;\n"
+        "layout(push_constant) uniform Params { mat4 previousClip; vec4 jitter; } pc;\n"
         "void main() {\n"
         "    ivec2 p = ivec2(gl_GlobalInvocationID.xy), extent = imageSize(motion);\n"
         "    if (any(greaterThanEqual(p, extent))) return;\n"
         "    vec2 size = vec2(extent), uv = (vec2(p) + 0.5) / size;\n"
         "    vec2 ndc = uv * vec2(2,-2) + vec2(-1,1);\n"
+        "    ndc -= pc.jitter.xy * vec2(2,-2) / size;\n"
         "    float z = texelFetch(depth,p,0).r * 2.0 - 1.0;\n"
         "    vec4 old = pc.previousClip * vec4(ndc,z,1);\n"
         "    vec2 mv = old.w > 1e-6 ? (old.xy / old.w - ndc) * size * vec2(0.5,-0.5) : vec2(0);\n"
@@ -387,7 +443,7 @@ static bool motion_init(VkCommandBuffer cb) {
         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}};
     VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .bindingCount = 2, .pBindings = binds};
-    VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};
+    VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 80};
     VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = &dlss.motion_set, .pushConstantRangeCount = 1, .pPushConstantRanges = &push};
     VkComputePipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -416,7 +472,10 @@ static void motion_dispatch(VkCommandBuffer cb, const float transform[16]) {
     vk_full_barrier(cb);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, dlss.motion_pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, dlss.motion_layout, 0, 1, &set, 0, NULL);
-    vkCmdPushConstants(cb, dlss.motion_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, transform);
+    float constants[20] = {0};
+    memcpy(constants, transform, 64);
+    constants[16] = dlss.scene_jitter[0]; constants[17] = dlss.scene_jitter[1];
+    vkCmdPushConstants(cb, dlss.motion_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof constants, constants);
     vkCmdDispatch(cb, (dlss.w + 7) / 8, (dlss.h + 7) / 8, 1);
     vk_full_barrier(cb);
 }
@@ -429,18 +488,27 @@ static NgxResource resource(VkImage img, VkImageView view, VkFormat fmt, uint32_
 static VkImageView evaluate(VkCommandBuffer cb, const TexBackend *color, VkImageView view, VkFormat fmt,
                            uint32_t ow, uint32_t oh, uint64_t frame) {
     if (!motion_init(cb)) return VK_NULL_HANDLE;
-    if (!dlss.parameters) {
+    bool fsr3 = g_settings.temporal_backend == TEMPORAL_FSR3 || g_settings.temporal_backend == TEMPORAL_FSR4;
+    bool xess = g_settings.temporal_backend == TEMPORAL_XESS;
+    bool nvidia = !fsr3 && !xess;
+    if (nvidia && !dlss.parameters) {
         unsigned r = ngx.allocate(&dlss.parameters);
         if (r != 1 || !dlss.parameters) { failed("parameter allocation", r); return VK_NULL_HANDLE; }
     }
     NgxParameters *p = dlss.parameters;
-    NgxSetPtr set_ptr = (NgxSetPtr)p->methods[0];
-    NgxSetInt set_int = (NgxSetInt)p->methods[3];
-    NgxSetUint set_uint = (NgxSetUint)p->methods[4];
-    NgxSetFloat set_float = (NgxSetFloat)p->methods[6];
-    if (!dlss.feature) {
+    NgxSetPtr set_ptr = p ? (NgxSetPtr)p->methods[0] : NULL;
+    NgxSetInt set_int = p ? (NgxSetInt)p->methods[3] : NULL;
+    NgxSetUint set_uint = p ? (NgxSetUint)p->methods[4] : NULL;
+    NgxSetFloat set_float = p ? (NgxSetFloat)p->methods[6] : NULL;
+    if (!dlss.output.image) {
         if (!make_image(&dlss.output, cb, ow, oh, VK_FORMAT_R16G16B16A16_SFLOAT,
                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return VK_NULL_HANDLE;
+        dlss.ow = ow; dlss.oh = oh;
+        dlss.feature_mode = temporal_mode(); dlss.feature_preset = g_settings.dlss_preset;
+        dlss.feature_backend = g_settings.temporal_backend;
+        dlss.feature_ml = g_settings.temporal_backend == TEMPORAL_FSR4 && vk_fsr4_available();
+    }
+    if (nvidia && !dlss.feature) {
         set_uint(p, "CreationNodeMask", 1);
         set_uint(p, "VisibilityNodeMask", 1);
         set_uint(p, "Width", dlss.w);
@@ -452,16 +520,17 @@ static VkImageView evaluate(VkCommandBuffer cb, const TexBackend *color, VkImage
         static const char *const hints[] = {NULL, "DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality",
             "DLSS.Hint.Render.Preset.Balanced", "DLSS.Hint.Render.Preset.Performance"};
         static const unsigned models[] = {0, 11, 12, 13};
-        set_int(p, "PerfQualityValue", quality[mode_at_start]);
-        set_uint(p, hints[mode_at_start], models[preset_at_start]);
+        int mode = g_settings.dlss_mode, preset = g_settings.dlss_preset;
+        set_int(p, "PerfQualityValue", quality[mode]);
+        unsigned model = preset == DLSS_PRESET_DEFAULT ? (mode == DLSS_PERFORMANCE ? 13 : 11) : models[preset];
+        set_uint(p, hints[mode], model);
         set_int(p, "DLSS.Feature.Create.Flags", 1 << 1);
         unsigned r = ngx.create(cb, 1, p, &dlss.feature);
         if (r != 1 || !dlss.feature) { failed("feature creation", r); return VK_NULL_HANDLE; }
         dlss.ow = ow;
         dlss.oh = oh;
-        LOG("[dlss] %s created: %ux%u -> %ux%u, preset hint %s\n", names[mode_at_start], dlss.w, dlss.h, ow, oh,
-            preset_at_start == DLSS_PRESET_K ? "K" : preset_at_start == DLSS_PRESET_L ? "L" :
-            preset_at_start == DLSS_PRESET_M ? "M" : "Default");
+        dlss.feature_mode = mode; dlss.feature_preset = preset;
+        LOG("[dlss] %s created: %ux%u -> %ux%u, preset hint %u\n", names[mode], dlss.w, dlss.h, ow, oh, model);
     }
 
     float matrix[16] = {0};
@@ -471,32 +540,68 @@ static VkImageView evaluate(VkCommandBuffer cb, const TexBackend *color, VkImage
     double direction = 0;
     for (int i = 8; i < 11; i++) direction += (double)dlss.scene.view[i] * dlss.previous.view[i];
     reset = reset || direction < 0.92 || !reprojection(matrix);
+    static int history_trace = -1;
+    static unsigned history_samples, history_resets, history_images, history_gaps;
+    if (history_trace < 0) history_trace = getenv("ODYSSEY_DLSS_HISTORY_TRACE") != NULL;
+    if (history_trace) {
+        history_samples++;
+        history_resets += reset;
+        history_images += dlss.history && dlss.source_depth != dlss.previous_depth;
+        history_gaps += dlss.history && dlss.last_eval + 1 != frame;
+        if (history_samples == 240) {
+            LOG("[dlss-history] %u evaluations: %u resets, %u depth-image changes, %u frame gaps\n",
+                history_samples, history_resets, history_images, history_gaps);
+            history_samples = history_resets = history_images = history_gaps = 0;
+        }
+    }
     if (reset) {
         memset(matrix, 0, sizeof matrix);
         for (int i = 0; i < 16; i += 5) matrix[i] = 1;
     }
     int stamp = timing_begin(cb, frame);
     motion_dispatch(cb, matrix);
-    NgxResource c = resource(color->image, view, fmt, dlss.w, dlss.h, VK_IMAGE_ASPECT_COLOR_BIT, false);
-    NgxResource d = resource(dlss.depth.image, dlss.depth.view, VK_FORMAT_D32_SFLOAT, dlss.w, dlss.h, VK_IMAGE_ASPECT_DEPTH_BIT, false);
-    NgxResource m = resource(dlss.motion.image, dlss.motion.view, VK_FORMAT_R16G16_SFLOAT, dlss.w, dlss.h, VK_IMAGE_ASPECT_COLOR_BIT, false);
-    NgxResource o = resource(dlss.output.image, dlss.output.view, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT, true);
-    set_ptr(p, "Color", &c);
-    set_ptr(p, "Depth", &d);
-    set_ptr(p, "MotionVectors", &m);
-    set_ptr(p, "Output", &o);
-    set_float(p, "Jitter.Offset.X", 0);
-    set_float(p, "Jitter.Offset.Y", 0);
-    set_float(p, "MV.Scale.X", 1);
-    set_float(p, "MV.Scale.Y", 1);
-    set_float(p, "DLSS.Pre.Exposure", 1);
-    set_float(p, "DLSS.Exposure.Scale", 1);
-    set_float(p, "FrameTimeDeltaInMsec", elapsed_ms > 0 && elapsed_ms < 100 ? (float)elapsed_ms : 16.667f);
-    set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", dlss.w);
-    set_uint(p, "DLSS.Render.Subrect.Dimensions.Height", dlss.h);
-    set_int(p, "Reset", reset);
+    unsigned r;
     uint64_t t0 = stamp >= 0 ? plat_now_ns() : 0;
-    unsigned r = ngx.evaluate(cb, dlss.feature, p, NULL);
+    if (fsr3 || xess) {
+        const float *proj = dlss.scene.projection;
+        float near_z = fabsf(proj[11] / (proj[10] - 1)), far_z = fabsf(proj[11] / (proj[10] + 1));
+        if (!isfinite(near_z) || near_z < 0.001f) near_z = 10;
+        if (!isfinite(far_z) || far_z <= near_z) far_z = 1000000;
+        Fsr3Frame f = {.color = color->image, .color_format = fmt, .depth = dlss.depth.image,
+            .motion = dlss.motion.image, .output = dlss.output.image, .w = dlss.w, .h = dlss.h, .ow = ow, .oh = oh,
+            .jitter = {dlss.scene_jitter[0], dlss.scene_jitter[1]}, .dt_ms = elapsed_ms > 0 && elapsed_ms < 100 ? elapsed_ms : 16.667f,
+            .near_z = near_z, .far_z = far_z, .fov_y = 2 * atanf(1 / fabsf(proj[5])),
+            .sharpness = *settings_temporal_sharpness() * 0.01f, .reset = reset,
+            .ml = g_settings.temporal_backend == TEMPORAL_FSR4};
+        if (xess) {
+            XessFrame x = {.frame = f, .color_view = view, .depth_view = dlss.depth.view,
+                .motion_view = dlss.motion.view, .output_view = dlss.output.view, .mode = temporal_mode()};
+            r = vk_xess_dispatch(cb, &x) ? 1 : 0;
+        } else r = vk_fsr3_dispatch(cb, &f) ? 1 : 0;
+    } else {
+        NgxResource c = resource(color->image, view, fmt, dlss.w, dlss.h, VK_IMAGE_ASPECT_COLOR_BIT, false);
+        NgxResource d = resource(dlss.depth.image, dlss.depth.view, VK_FORMAT_D32_SFLOAT, dlss.w, dlss.h, VK_IMAGE_ASPECT_DEPTH_BIT, false);
+        NgxResource m = resource(dlss.motion.image, dlss.motion.view, VK_FORMAT_R16G16_SFLOAT, dlss.w, dlss.h, VK_IMAGE_ASPECT_COLOR_BIT, false);
+        NgxResource o = resource(dlss.output.image, dlss.output.view, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT, true);
+        set_ptr(p, "Color", &c);
+        set_ptr(p, "Depth", &d);
+        set_ptr(p, "MotionVectors", &m);
+        set_ptr(p, "Output", &o);
+        // Match the viewport displacement in right/down input pixels (as in Astral
+        // Chain's viewport/NGX pair). Camera vectors exclude jitter: MVJittered unset.
+        set_float(p, "Jitter.Offset.X", dlss.scene_jitter[0]);
+        set_float(p, "Jitter.Offset.Y", dlss.scene_jitter[1]);
+        set_float(p, "Sharpness", 0); // current models use the explicit post-sharpening passes
+        set_float(p, "MV.Scale.X", 1);
+        set_float(p, "MV.Scale.Y", 1);
+        set_float(p, "DLSS.Pre.Exposure", 1);
+        set_float(p, "DLSS.Exposure.Scale", 1);
+        set_float(p, "FrameTimeDeltaInMsec", elapsed_ms > 0 && elapsed_ms < 100 ? (float)elapsed_ms : 16.667f);
+        set_uint(p, "DLSS.Render.Subrect.Dimensions.Width", dlss.w);
+        set_uint(p, "DLSS.Render.Subrect.Dimensions.Height", dlss.h);
+        set_int(p, "Reset", reset);
+        r = ngx.evaluate(cb, dlss.feature, p, NULL);
+    }
     dlss.input_seq = dlss.output_seq = vk_pending_seq();
     if (stamp >= 0) {
         double ms = (plat_now_ns() - t0) / 1e6;
@@ -504,26 +609,38 @@ static VkImageView evaluate(VkCommandBuffer cb, const TexBackend *color, VkImage
         vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, timing.pool, 2 * stamp + 1);
     }
     vk_full_barrier(cb);
-    if (r != 1) { failed("evaluation", r); return VK_NULL_HANDLE; }
+    if (r != 1) { if (nvidia) failed("evaluation", r); return VK_NULL_HANDLE; }
     dlss.previous = dlss.scene;
     dlss.previous_depth = dlss.source_depth;
     dlss.history = true;
     dlss.last_eval = frame;
     dlss.last_eval_ns = now;
     if (++dlss.eval_count == 1 || dlss.eval_count % 240 == 0)
-        LOG("[dlss] frame %llu: %llu evaluated frames\n", (unsigned long long)frame, (unsigned long long)dlss.eval_count);
+        LOG("[%s] frame %llu: %llu evaluated frames\n", xess ? "xess" : fsr3 ?
+            (g_settings.temporal_backend == TEMPORAL_FSR4 && vk_fsr4_available() ? "fsr4" : "fsr3") : "dlss",
+            (unsigned long long)frame, (unsigned long long)dlss.eval_count);
     return dlss.output.view;
 }
 
 static bool can_evaluate(const TexBackend *color, uint32_t ow, uint32_t oh, uint64_t frame) {
-    if (!vk_dlss_enabled() || !dlss.scene_ready || dlss.frame != frame ||
+    static uint64_t next_trace;
+    if (getenv("ODYSSEY_DLSS_HISTORY_TRACE") && frame >= next_trace) {
+        LOG("[dlss-state] frame %llu enabled %d camera %d scene %d scene-frame %llu colour %ux%u depth %ux%u output %ux%u\n",
+            (unsigned long long)frame, vk_temporal_enabled(), dlss.camera_ready, dlss.scene_ready, (unsigned long long)dlss.frame,
+            color->width, color->height, dlss.w, dlss.h, ow, oh);
+        next_trace = frame + 240;
+    }
+    if (!vk_temporal_enabled() || !dlss.scene_ready || dlss.frame != frame ||
         (dlss.history && dlss.last_eval == frame) || color->width != dlss.w || color->height != dlss.h ||
-        ow < dlss.w || oh < dlss.h || (mode_at_start != DLSS_DLAA && (ow == dlss.w || oh == dlss.h))) return false;
+        ow < dlss.w || oh < dlss.h || (temporal_mode() != DLSS_DLAA && (ow == dlss.w || oh == dlss.h))) return false;
+    if (temporal_mode() == DLSS_DLAA && (ow != dlss.w || oh != dlss.h)) return false;
     return true;
 }
 
 static bool ensure_output(uint32_t ow, uint32_t oh) {
-    return !dlss.ow || (dlss.ow == ow && dlss.oh == oh) || reset_output();
+    return !dlss.ow || (dlss.ow == ow && dlss.oh == oh && dlss.feature_mode == temporal_mode() &&
+                        dlss.feature_preset == g_settings.dlss_preset && dlss.feature_backend == g_settings.temporal_backend &&
+                        dlss.feature_ml == (g_settings.temporal_backend == TEMPORAL_FSR4 && vk_fsr4_available())) || reset_output();
 }
 
 VkImageView vk_dlss_upscale(VkCommandBuffer cb, const TexBackend *color, VkImageView view,

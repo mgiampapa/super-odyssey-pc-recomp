@@ -6,6 +6,7 @@
 #include <SDL3/SDL.h>
 #include <ctype.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,7 @@
 #include "../settings.h"
 #include "../input_bind.h"
 #include "../nvn/kbprompts.h"
+#include "motion_gate.h"
 
 enum {
     BTN_A = 0, BTN_B, BTN_X, BTN_Y, BTN_LSTICK, BTN_RSTICK, BTN_L, BTN_R, BTN_ZL, BTN_ZR, BTN_PLUS, BTN_MINUS,
@@ -273,8 +275,15 @@ static void note_family(void) {
     if (pad) switch (SDL_GetGamepadType(pad)) {
         case SDL_GAMEPAD_TYPE_XBOX360: case SDL_GAMEPAD_TYPE_XBOXONE: f = 1; break;
         case SDL_GAMEPAD_TYPE_PS3: case SDL_GAMEPAD_TYPE_PS4: case SDL_GAMEPAD_TYPE_PS5: f = 2; break;
-        default: break;
-    }
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: break;
+        default:  // (a Steam Deck's own controls, a generic pad: by what its bottom face button says)
+            switch (SDL_GetGamepadButtonLabel(pad, SDL_GAMEPAD_BUTTON_SOUTH)) {
+            case SDL_GAMEPAD_BUTTON_LABEL_A: f = 1; break;
+            case SDL_GAMEPAD_BUTTON_LABEL_CROSS: f = 2; break;
+            default: break;
+            }
+        }
     if (f != pad_family) LOG("[input] button prompts: %s controller\n", f == 1 ? "Xbox" : f == 2 ? "PlayStation" : "Nintendo / other");
     pad_family = f;
 }
@@ -287,13 +296,196 @@ int input_pad_family(void) {
     return env >= 0 ? env : pad_family;
 }
 
+// ---------------------------------------------------------------- motion (the game's six-axis sensor)
+// Odyssey reads the controller's motion for its motion moves (a shake throws the cap at a homing target, spins,
+// tilting): nn::hid GetSixAxisSensorStates. It comes from the active controller's gyro and accelerometer (SDL),
+// turned into the Switch's axes and units (as Switch emulators do: acceleration in G, rotation in turns a second,
+// the angle and orientation integrated from it). Controls tab "Motion controls" (`motion` in powermoon.ini).
+static pthread_mutex_t motion_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    bool on;              // the active pad has a gyro or an accelerometer
+    float accel[3], gyro[3], angle[3], dir[9];
+    uint64_t gyro_ns;     // the last gyro sample's time (sensor clock)
+    int64_t sampling;
+    uint64_t last_read_ns;
+    MotionGate gate;
+    MotionBias bias;
+} mot = {.dir = {1, 0, 0, 0, 1, 0, 0, 0, 1},
+         .gate.last = {[2] = -1, [9] = 1, [13] = 1, [17] = 1}};
+
+void input_motion_settle(void) {
+    pthread_mutex_lock(&motion_lock);
+    motion_gate_settle(&mot.gate, plat_now_ns());
+    mot.gyro_ns = 0;
+    pthread_mutex_unlock(&motion_lock);
+}
+
+static void motion_open(void) {
+    bool a = false, g = false;
+    if (pad) {
+        a = SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
+        g = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
+    }
+    pthread_mutex_lock(&motion_lock);
+    mot.on = a || g;
+    memset(mot.accel, 0, sizeof mot.accel);
+    mot.accel[2] = -1;  // (at rest, lying flat)
+    memset(mot.gyro, 0, sizeof mot.gyro);
+    memset(mot.angle, 0, sizeof mot.angle);
+    static const float id[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    memcpy(mot.dir, id, sizeof id);
+    mot.gyro_ns = 0;
+    motion_gate_init(&mot.gate);
+    memset(&mot.bias, 0, sizeof mot.bias);
+    motion_gate_settle(&mot.gate, plat_now_ns());
+    pthread_mutex_unlock(&motion_lock);
+    if (pad) LOG("[input] motion: %s%s%s\n", a ? "accelerometer" : "", a && g ? " and " : "", g ? "gyro" : a ? "" : "none on this controller");
+}
+
+// A rotation of the orientation by w (radians) about each axis: R' = R * exp([w]x) (Rodrigues), kept orthonormal
+static void rotate_dir(float *R, const float w[3]) {
+    float th = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+    if (th < 1e-9f) return;
+    float k[3] = {w[0] / th, w[1] / th, w[2] / th}, c = cosf(th), s = sinf(th), t = 1 - c;
+    float M[9] = {t * k[0] * k[0] + c,        t * k[0] * k[1] - s * k[2], t * k[0] * k[2] + s * k[1],
+                  t * k[0] * k[1] + s * k[2], t * k[1] * k[1] + c,        t * k[1] * k[2] - s * k[0],
+                  t * k[0] * k[2] - s * k[1], t * k[1] * k[2] + s * k[0], t * k[2] * k[2] + c};
+    float o[9];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) o[i * 3 + j] = R[i * 3] * M[j] + R[i * 3 + 1] * M[3 + j] + R[i * 3 + 2] * M[6 + j];
+    for (int i = 0; i < 3; i++) {  // (Gram-Schmidt on the rows)
+        float *a = o + i * 3;
+        for (int j = 0; j < i; j++) {
+            float *b = o + j * 3, d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+            for (int q = 0; q < 3; q++) a[q] -= d * b[q];
+        }
+        float n = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+        if (n > 1e-6f) for (int q = 0; q < 3; q++) a[q] /= n;
+    }
+    memcpy(R, o, sizeof o);
+}
+
+static void motion_event(const SDL_GamepadSensorEvent *e) {
+    if (!pad || SDL_GetGamepadID(pad) != e->which) return;
+    const float G = SDL_STANDARD_GRAVITY, TURN = 6.28318531f;
+    pthread_mutex_lock(&motion_lock);
+    // SDL: x right, y up, z toward the player (m/s^2, rad/s). The Switch: x = -x, y = z, z = -y (a mirror: the
+    // rotation's axes the other way round)
+    if (menu_input_captured()) mot.gate.blocked = true;
+    if (e->sensor == SDL_SENSOR_ACCEL) {
+        mot.accel[0] = -e->data[0] / G, mot.accel[1] = e->data[2] / G, mot.accel[2] = -e->data[1] / G;
+    } else if (e->sensor == SDL_SENSOR_GYRO) {
+        float g[3] = {e->data[0], -e->data[2], e->data[1]};  // rad/s
+        for (int i = 0; i < 3; i++) mot.gyro[i] = g[i] / TURN;
+        uint64_t host_now = plat_now_ns();
+        motion_bias_sample(&mot.bias, mot.accel, mot.gyro, host_now < mot.gate.settle_until_ns, host_now);
+        uint64_t t = e->sensor_timestamp;
+        bool integrate = g_settings.motion && !menu_input_captured() && !mot.gate.blocked &&
+                         (!mot.gate.resume_ns || plat_now_ns() - mot.gate.resume_ns >= 250000000ull);
+        if (integrate && mot.gyro_ns && t > mot.gyro_ns && t - mot.gyro_ns < 100000000ull) {
+            float dt = (float)(t - mot.gyro_ns) / 1e9f;
+            float w[3] = {mot.gyro[0] * TURN * dt, mot.gyro[1] * TURN * dt, mot.gyro[2] * TURN * dt};
+            for (int i = 0; i < 3; i++) mot.angle[i] += mot.gyro[i] * dt;
+            rotate_dir(mot.dir, w);
+        }
+        mot.gyro_ns = t;
+    }
+    static int log = -1;  // ODYSSEY_LOG_MOTION=1: the readings once a second
+    static uint64_t logged;
+    if (log < 0) log = getenv("ODYSSEY_LOG_MOTION") != NULL;
+    if (log && plat_now_ns() - logged > 1000000000ull) {
+        logged = plat_now_ns();
+        LOG("[input] motion: accel %.2f %.2f %.2f G, gyro %.3f %.3f %.3f turns/s\n", mot.accel[0], mot.accel[1],
+            mot.accel[2], mot.gyro[0], mot.gyro[1], mot.gyro[2]);
+    }
+    pthread_mutex_unlock(&motion_lock);
+}
+
+// GetSixAxisSensorHandles(SixAxisSensorHandle *out, int count, const NpadIdType &id, NpadStyleSet) -> how many:
+// one (a Pro Controller's), two for a pair of Joy-Cons. The handle: style index, player, device index.
+HLE_FUNC("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE",
+         hid_sixaxis_handles) {
+    uint32_t *out = (uint32_t *)(uintptr_t)c->x[0];
+    int count = (int)c->x[1];
+    uint32_t id = *(uint32_t *)(uintptr_t)c->x[2], style = (uint32_t)c->x[3];
+    int n = style & 4 ? 2 : 1;  // (JoyDual: left and right)
+    if (n > count) n = count < 0 ? 0 : count;
+    for (int i = 0; i < n; i++) out[i] = (style & 4 ? 5u : style & 2 ? 4u : 3u) | (id & 0xFF) << 8 | (uint32_t)i << 16;
+    static int nlog;
+    if (nlog++ < 4) LOG("[input] six-axis handles for player %u, style %#x: %d\n", id, style, n);
+    c->x[0] = (uint64_t)n;
+}
+HLE_FUNC("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", hid_sixaxis_start) {
+    input_motion_settle();
+    static int nlog;
+    if (nlog++ < 4) LOG("[input] six-axis sensor %#x started\n", *(uint32_t *)(uintptr_t)c->x[0]);
+}
+
+// GetSixAxisSensorStates(SixAxisSensorState *out, int count, const SixAxisSensorHandle &) -> how many, newest first.
+// SixAxisSensorState (0x60): s64 delta time (ns), s64 sampling number, float acceleration[3], angular velocity[3],
+// angle[3], direction[3][3], u32 attributes (1: connected), u32 reserved.
+HLE_FUNC("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", hid_sixaxis_states) {
+    uint8_t *s = (uint8_t *)(uintptr_t)c->x[0];
+    if ((int)c->x[1] < 1) { c->x[0] = 0; return; }
+    memset(s, 0, 0x60);
+    uint64_t now = plat_now_ns();
+    pthread_mutex_lock(&motion_lock);
+    bool live = mot.on && g_settings.motion && !menu_input_captured();
+    if (!mot.last_read_ns || (now > mot.last_read_ns && now - mot.last_read_ns > 500000000ull)) {
+        motion_gate_settle(&mot.gate, now);
+        mot.gyro_ns = 0;
+    }
+    *(int64_t *)s = mot.last_read_ns && now > mot.last_read_ns ? (int64_t)(now - mot.last_read_ns) : 5000000;
+    mot.last_read_ns = now;
+    *(int64_t *)(s + 8) = ++mot.sampling;
+    float *f = (float *)(s + 0x10);
+    if (live) {
+        memcpy(f, mot.accel, 12);
+        memcpy(f + 3, mot.gyro, 12);
+        memcpy(f + 6, mot.angle, 12);
+        memcpy(f + 9, mot.dir, 36);
+    } else {
+        f[2] = -1;  // (no motion: a controller lying still, so the game sees no shake)
+        f[9] = f[13] = f[17] = 1;
+    }
+    // Preserve the last pose rather than injecting a sudden gravity/orientation
+    // change when the menu takes control; discard menu movement on resume.
+    motion_gate_sample(&mot.gate, f, !live, now);
+    *(uint32_t *)(s + 0x58) = 1;
+    {   // ODYSSEY_LOG_MOTION=1: what the game reads, once a second (how many samples it asks for, the values)
+        static int log = -1;
+        static uint64_t logged;
+        if (log < 0) log = getenv("ODYSSEY_LOG_MOTION") != NULL;
+        if (log && now - logged > 1000000000ull) {
+            logged = now;
+            LOG("[input] game reads motion (asks %d, handle %#x, %s): accel %.2f %.2f %.2f gyro %.3f %.3f %.3f\n", (int)c->x[1],
+                *(uint32_t *)(uintptr_t)c->x[2], live ? "live" : "at rest", f[0], f[1], f[2], f[3], f[4], f[5]);
+        }
+    }
+    pthread_mutex_unlock(&motion_lock);
+    c->x[0] = 1;
+}
+
+// The active controller: the first one found, then whichever one a button was last pressed on (a second controller
+// takes over at its first press; its icons and motion follow)
+static void use_pad(SDL_Gamepad *p) {
+    if (!p || p == pad) return;
+    pad = p;
+    LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad));
+    note_family();
+    motion_open();
+}
+
 void input_handle_event(const SDL_Event *e) {
     static bool scanned;  // pads present at startup: their ADDED event may have gone to the start screen's loop
     if (!scanned) {
         scanned = true;
         int n = 0;
         SDL_JoystickID *ids = SDL_GetGamepads(&n);
-        if (n > 0 && !pad) { pad = SDL_OpenGamepad(ids[0]); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        for (int i = 0; i < n; i++) {
+            SDL_Gamepad *p = SDL_OpenGamepad(ids[i]);
+            if (!pad) use_pad(p);
+        }
         SDL_free(ids);
     }
     switch (e->type) {
@@ -309,13 +501,32 @@ void input_handle_event(const SDL_Event *e) {
         recompute_keyboard();
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
-        if (!pad) { pad = SDL_OpenGamepad(e->gdevice.which); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        {
+            SDL_Gamepad *p = SDL_GetGamepadFromID(e->gdevice.which);
+            if (!p) p = SDL_OpenGamepad(e->gdevice.which);
+            if (!pad) use_pad(p);
+        }
         break;
     case SDL_EVENT_GAMEPAD_REMOVED:
-        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; note_family(); }
+        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) {
+            SDL_CloseGamepad(pad);
+            pad = NULL;
+            int n = 0;  // (another one still connected takes over)
+            SDL_JoystickID *ids = SDL_GetGamepads(&n);
+            for (int i = 0; i < n && !pad; i++) if (ids[i] != e->gdevice.which) use_pad(SDL_GetGamepadFromID(ids[i]));
+            SDL_free(ids);
+            if (!pad) { note_family(); motion_open(); }
+        } else {
+            SDL_Gamepad *p = SDL_GetGamepadFromID(e->gdevice.which);
+            if (p) SDL_CloseGamepad(p);
+        }
         recompute_pad();
         break;
+    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+        motion_event(&e->gsensor);
+        break;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        if (!pad || SDL_GetGamepadID(pad) != e->gbutton.which) use_pad(SDL_GetGamepadFromID(e->gbutton.which));
         kbprompts_note_device(false);
         // SDL's live state may already contain the release when its queued press is handled.
         if (pad && SDL_GetGamepadID(pad) == e->gbutton.which) {

@@ -51,7 +51,8 @@ extern Game g_game;
 static inline bool game_is_odyssey(void) { return g_game == GAME_ODYSSEY; }
 void odyssey_boot(void);  // each boot after dispatch_init: Odyssey test tools (hle/odyssey_warp.c)
 void odyssey_native_120_boot(void);
-bool odyssey_native_120_enabled(void);
+bool odyssey_native_120_enabled(void);  // (90 or 120 draws a second: the extra-draw loop on)
+int odyssey_native_hz(void);              // its draws a second: 90 or 120 (60: off)
 Game loader_peek_game(const char *nso_path);  // from the file's header alone, before loading (GAME_OTHER: unknown)
 void loader_load(const char *exefs_dir);  // (again after a reboot: modules are reloaded into wiped memory)
 uint64_t loader_find_symbol(const char *name);

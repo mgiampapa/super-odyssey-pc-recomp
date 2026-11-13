@@ -1,4 +1,5 @@
-// Odyssey 1.0.0: evaluate skeletal clips at the half tick for the native draw-only frame.
+// Odyssey 1.0.0: evaluate skeletal clips between gameplay ticks for the native draws (120 FPS: the draw-only frame at
+// the half tick; 90 FPS: every draw at its own fraction of a tick, runtime/hle/odyssey_120.c)
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,11 +102,11 @@ void odyssey_pose_end(uint64_t tick) {
             if (last->keeper != model->keeper || last->player != model->player || last->ctrl != model->ctrl) continue;
             float step[3], travel = 0.0f;
             for (unsigned axis = 0; axis < 3; axis++) {
-                step[axis] = 0.5f * (model->position[axis] - last->position[axis]);
+                step[axis] = model->position[axis] - last->position[axis];  // (a whole tick's movement)
                 travel += step[axis] * step[axis];
             }
             // A teleport or an asset swap should show the new position immediately.
-            if (travel <= 30.0f * 30.0f) memcpy(model->step, step, sizeof step);
+            if (travel <= 60.0f * 60.0f) memcpy(model->step, step, sizeof step);
             break;
         }
     }
@@ -152,7 +153,7 @@ static bool find_pose(Pose *pose, Model model) {
     return true;
 }
 
-static bool advance_tracks(Pose *pose) {
+static bool advance_tracks(Pose *pose, float lead) {
     unsigned tracks = *(const uint32_t *)(uintptr_t)(pose->player + 0x20);
     uint64_t clips = pointer_at(pose->player + 0x28);
     if (!clips || tracks > MAX_TRACKS) return false;
@@ -160,7 +161,7 @@ static bool advance_tracks(Pose *pose) {
         uint64_t clip = pointer_at(clips + 8 * i);
         float *frame = clip ? (float *)(uintptr_t)pointer_at(clip + 8) : NULL;
         if (!frame) continue;
-        float next = frame[0] + 0.5f * frame[3];
+        float next = frame[0] + lead * frame[3];
         if (!isfinite(next) || next == frame[0] || next < frame[1] || next > frame[2]) continue;
         pose->tracks[pose->track_count] = frame;
         pose->frames[pose->track_count++] = frame[0];
@@ -242,11 +243,11 @@ static Palette *sample_palette(Cpu *c, const Pose *pose) {
     return palette;
 }
 
-static Palette *sample_model(Cpu *c, Model model) {
+static Palette *sample_model(Cpu *c, Model model, float lead) {
     Pose pose;
     if (!find_pose(&pose, model)) return NULL;
-    bool animate = advance_tracks(&pose);
-    bool move = model.step[0] != 0.0f || model.step[1] != 0.0f || model.step[2] != 0.0f;
+    bool animate = advance_tracks(&pose, lead);
+    bool move = lead != 0.0f && (model.step[0] != 0.0f || model.step[1] != 0.0f || model.step[2] != 0.0f);
     if (!animate && !move) return NULL;
 
     // Reuse the game's evaluator. Restore its working matrices and clip state before any gameplay code sees them.
@@ -264,7 +265,7 @@ static Palette *sample_model(Cpu *c, Model model) {
     if (move) {
         for (unsigned i = 0; i < pose.bones; i++) {
             float *translation = (float *)(void *)(pose.world + WORLD_STRIDE * i) + 12;
-            for (unsigned j = 0; j < 3; j++) translation[j] += model.step[j];
+            for (unsigned j = 0; j < 3; j++) translation[j] += lead * model.step[j];
         }
     }
     Palette *palette = memcmp(world, pose.world, world_size) ? sample_palette(c, &pose) : NULL;
@@ -273,7 +274,7 @@ static Palette *sample_model(Cpu *c, Model model) {
         static unsigned samples;
         if (trace < 0) trace = getenv("ODYSSEY_NATIVE_120_TRACE") != NULL;
         if (trace && !(samples++ % 15))
-            LOG("[motion-120] Mario render offset %.3f %.3f %.3f\n", model.step[0], model.step[1], model.step[2]);
+            LOG("[motion-120] Mario render offset %.3f %.3f %.3f\n", lead * model.step[0], lead * model.step[1], lead * model.step[2]);
     }
 
     if (animate) {
@@ -287,10 +288,10 @@ static Palette *sample_model(Cpu *c, Model model) {
     return palette;
 }
 
-void odyssey_pose_draw(Cpu *c) {
+void odyssey_pose_draw(Cpu *c, float lead) {
     OdysseyPoseFrame *frame = NULL;
     for (unsigned i = 0; i < model_count; i++) {
-        Palette *palette = sample_model(c, models[i]);
+        Palette *palette = sample_model(c, models[i], lead);
         if (!palette) continue;
         if (!frame) {
             frame = calloc(1, sizeof *frame);

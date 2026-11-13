@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "gamelib.h"
+#include "diagnostics.h"
 #include "paths.h"
 #include "settings.h"
 #include "hle.h"
@@ -164,6 +165,7 @@ static void boot(const char *root) {
 
 int main(int argc, char **argv) {
     plat_init();
+    diagnostics_init();
 #ifdef _WIN32
     setvbuf(stderr, NULL, _IONBF, 0);  // the Windows CRT treats _IOLBF as full buffering
 #else

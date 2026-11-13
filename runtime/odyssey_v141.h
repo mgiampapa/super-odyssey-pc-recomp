@@ -6,7 +6,7 @@
 //     its 0x4000 flag); odyssey_120.c needs another way for its extra draws
 //   - nn::g3d::SkeletonObj::CalculateWorldMtx: inlined into its callers in 1.4.1 (no candidate near its 4 callers)
 //   - sead::system::HaltWithDetail / PrintStringImpl: no candidate (probably dropped with the release build's asserts)
-//   - the stage warp test tool's and the heap diagnostics' names (runtime/hle/odyssey_warp.c, diag.c): not ported yet
+//   - the completed-save builder's and heap diagnostics' names: not ported yet
 #pragma once
 #include <stdint.h>
 
@@ -19,6 +19,9 @@ static const OdysseyV141Sym ODYSSEY_V141_SYMS[] = {
     {"_ZN2al15GameFrameworkNx9procDraw_Ev", 0x70006254b0ull},                          // vtable slot 30
     {"_ZNK10StageScene8drawMainEv", 0x7000473270ull},                                  // vtable slot 8
     {"_ZNK20DemoChangeWorldScene8drawMainEv", 0x7000446d80ull},                        // fuzzy 0.47, same size
+    {"_ZNK9DemoScene8drawMainEv", 0x7000448390ull},                                   // vtable DemoScene slot 8
+    {"_ZN2al13getProjectionEPKNS_10IUseCameraEi", 0x70005b3e10ull},                    // code shape
+    {"_ZNK4sead10Projection25getDeviceProjectionMatrixEv", 0x7000967d30ull},           // call graph
     {"_ZN4sead15GameFrameworkNx9procCalc_Ev", 0x70009421a0ull},                        // vtable slot 31
     {"_ZN4sead13ControllerMgr4calcEv", 0x7000964b10ull},                               // vtable slot 22
     {"_ZN2al18updateGraphicsPrevEPNS_5SceneE", 0x700074e940ull},                       // code shape
@@ -33,6 +36,11 @@ static const OdysseyV141Sym ODYSSEY_V141_SYMS[] = {
     // the stage (runtime/hle/odyssey_warp.c)
     {"_ZN10StageScene4initERKN2al13SceneInitInfoE", 0x700046e7a0ull},                  // vtable slot 3
     {"_ZN10StageScene7controlEv", 0x7000472af0ull},                                    // vtable slot 7
+    // Warp test tool: verified constructor fields/call sites and neighboring wrappers in both builds.
+    {"_ZN15ChangeStageInfoC1EPK14GameDataHolderPKcS4_biNS_15SubScenarioTypeE", 0x700021c040ull},
+    {"_ZN16GameDataFunction18tryChangeNextStageE20GameDataHolderWriterPK15ChangeStageInfo", 0x70004d2c50ull},
+    {"_ZN16GameDataFunction35tryChangeNextStageWithDemoWorldWarpE20GameDataHolderWriterPKc", 0x70004d2d30ull},
+    {"_ZN16GameDataFunction19getCurrentStageNameE22GameDataHolderAccessor", 0x70004d2df0ull},
 };
 
 // Addresses the runtime uses directly for 1.0.0, and their 1.4.1 counterparts

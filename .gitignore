@@ -50,3 +50,4 @@ generated141/
 /toolchain/
 # local assistant settings
 /.claude/settings.local.json
+tools/release.local.sh

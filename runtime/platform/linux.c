@@ -19,7 +19,10 @@
 #include <unistd.h>
 
 #include "../mods.h"
+#include "../diagnostics.h"
+#include "../paths.h"
 #include "../platform.h"
+#include "../rt.h"
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -28,18 +31,33 @@
 // ---- guest address space
 // Everything readable/writable from the start, like macOS: the guest maps at 4K granularity, and untouched pages
 // cost nothing (MAP_NORESERVE: the 12 GB window doesn't count against overcommit).
+// The guest heap in huge pages (2 MB, transparent huge pages): the renderer imports the heap as one GPU buffer
+// (nvn/vulkan/exec.c gmem_import), and the amdgpu kernel driver walks such an imported range page by page on every
+// submission - 3.1 GB in 4 KB pages took 4.3 ms per submission on a Steam Deck, 45% of the render thread. madvise lets
+// the kernel assemble huge pages there (by default it only does where asked). ODYSSEY_THP=0: as before.
+static void heap_huge_pages(uint64_t lo, uint64_t hi) {
+    const char *e = getenv("ODYSSEY_THP");
+    if (e && !atoi(e)) return;
+    uint64_t a = HEAP_BASE > lo ? HEAP_BASE : lo, b = HEAP_BASE + HEAP_MAX < hi ? HEAP_BASE + HEAP_MAX : hi;
+    if (a < b && madvise((void *)(uintptr_t)a, b - a, MADV_HUGEPAGE) != 0)
+        fprintf(stderr, "[mem] huge pages for the guest heap not available (%s)\n", strerror(errno));
+}
+
 bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
     void *p = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
     if (p == MAP_FAILED) return false;
     if (p != (void *)(uintptr_t)lo) { munmap(p, hi - lo); return false; }  // (kernels before 4.17: just a hint)
+    heap_huge_pages(lo, hi);
     return true;
 }
 
 // Fresh zero pages over the whole window (the old ones are released at once).
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
-    return mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
-                -1, 0) == (void *)(uintptr_t)lo;
+    bool ok = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
+                   -1, 0) == (void *)(uintptr_t)lo;
+    if (ok) heap_huge_pages(lo, hi);
+    return ok;
 }
 
 void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
@@ -80,6 +98,7 @@ void plat_thread_realtime(uint64_t period_ns) {
 // (runtime/paths.h; rt_paths_init runs later, so the same rule is applied here). Processes started by this one (the
 // re-exec for a fresh address layout) append to the same log.
 static char g_log_path[1024];
+const char *plat_log_path(void) { return g_log_path; }
 
 static void log_to_file_without_terminal(void) {
     if (isatty(STDERR_FILENO)) return;
@@ -88,8 +107,9 @@ static void log_to_file_without_terminal(void) {
     struct stat st;
     if (env && *env) snprintf(dir, sizeof dir, "%s", env);
     else if (stat("extracted", &st) == 0 && S_ISDIR(st.st_mode)) return;  // dev mode: wherever stderr goes already
-    else if (xdg && *xdg == '/') snprintf(dir, sizeof dir, "%s/power-moon-recomp", xdg);
-    else snprintf(dir, sizeof dir, "%s/.local/share/power-moon-recomp", home && *home ? home : "/tmp");
+    // (before the data root is known: the default one, on the internal drive - small, whatever folder the game is in)
+    else if (xdg && *xdg == '/') snprintf(dir, sizeof dir, "%s/" RT_LINUX_DIR, xdg);
+    else snprintf(dir, sizeof dir, "%s/.local/share/" RT_LINUX_DIR, home && *home ? home : "/tmp");
     for (char *c = dir + 1; *c; c++)
         if (*c == '/') { *c = 0; mkdir(dir, 0755); *c = '/'; }
     mkdir(dir, 0755);
@@ -173,19 +193,143 @@ const char *plat_symbol(uint64_t pc, uint64_t *offset) {
 
 // Fatal error without a terminal: say so in a message box rather than vanishing (the details are in the log).
 uint64_t plat_private_bytes(void) { return 0; }
+uint64_t plat_resident_bytes(void) {
+    FILE *f = fopen("/proc/self/statm", "r");
+    unsigned long long size = 0, rss = 0;
+    if (f) {
+        if (fscanf(f, "%llu %llu", &size, &rss) != 2) rss = 0;
+        fclose(f);
+    }
+    return rss * (uint64_t)sysconf(_SC_PAGESIZE);
+}
+uint64_t plat_total_ram(void) { return (uint64_t)sysconf(_SC_PHYS_PAGES) * (uint64_t)sysconf(_SC_PAGESIZE); }
 uint64_t plat_guest_bytes(void) { return 0; }
 uint64_t plat_heap_bytes(void) { return 0; }
 void plat_heap_histogram(void) {}
 void plat_heap_check(const char *where) { (void)where; }
 
+// An error before the game has a window of its own (the first start: no Vulkan driver, say), in a plain window of ours:
+// SDL's text, the software renderer. SDL's message box draws its own X11 window without WM_CLASS and with a WM_NAME
+// that older tools can't read (the AppImage catalog's test, xdotool 2016, never saw it), and in a Wayland session
+// without Xwayland it needs zenity. Closed by Enter / Escape / a click / a controller button / the window's X.
+static bool error_window(const char *text) {
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) return false;
+    SDL_InitSubSystem(SDL_INIT_GAMEPAD);  // (a Steam Deck: the A button closes it)
+    enum { W = 760, SCALE = 2, CH = 8 * SCALE, LINE = 12 * SCALE, MARGIN = 20 };
+    const int cols = (W - 2 * MARGIN) / CH;
+    // word-wrapped lines (a word longer than a line - a path - is cut where the line ends)
+    static char lines[64][128];
+    int n = 0, len = 0;
+    for (const char *p = text; *p && n < 60;) {
+        if (*p == '\n') { lines[n][len] = 0; n++, len = 0; p++; continue; }
+        size_t word = strcspn(p, " \n");
+        if (len && len + (int)word > cols) { lines[n][len] = 0; n++, len = 0; }
+        if (*p == ' ' && !len) { p++; continue; }
+        size_t take = word ? word : 1;
+        if (take > (size_t)(cols - len)) take = (size_t)(cols - len);
+        memcpy(lines[n] + len, p, take);
+        len += (int)take, p += take;
+        if (len >= cols) { lines[n][len] = 0; n++, len = 0; }
+    }
+    if (len) lines[n][len] = 0, n++;
+    const char *hint = "Enter or a click closes this window.";
+    int h = MARGIN * 2 + (n + 2) * LINE;
+    SDL_Window *w = SDL_CreateWindow(RT_APP_NAME, W, h, 0);
+    if (!w) return false;
+    SDL_Renderer *r = SDL_CreateRenderer(w, "software");
+    if (!r) r = SDL_CreateRenderer(w, NULL);
+    if (!r) { SDL_DestroyWindow(w); return false; }
+    SDL_SetRenderScale(r, SCALE, SCALE);
+    for (bool done = false; !done;) {
+        SDL_SetRenderDrawColor(r, 32, 32, 36, 255);
+        SDL_RenderClear(r);
+        SDL_SetRenderDrawColor(r, 235, 235, 235, 255);
+        for (int i = 0; i < n; i++)
+            SDL_RenderDebugText(r, MARGIN / (float)SCALE, (MARGIN + i * LINE) / (float)SCALE, lines[i]);
+        SDL_SetRenderDrawColor(r, 150, 150, 160, 255);
+        SDL_RenderDebugText(r, MARGIN / (float)SCALE, (MARGIN + (n + 1) * LINE) / (float)SCALE, hint);
+        SDL_RenderPresent(r);
+        SDL_Event e;
+        if (!SDL_WaitEventTimeout(&e, 250)) continue;
+        do {
+            switch (e.type) {
+            case SDL_EVENT_QUIT: case SDL_EVENT_WINDOW_CLOSE_REQUESTED: case SDL_EVENT_MOUSE_BUTTON_UP:
+            case SDL_EVENT_GAMEPAD_BUTTON_DOWN: done = true; break;
+            case SDL_EVENT_KEY_DOWN:
+                if (e.key.key == SDLK_RETURN || e.key.key == SDLK_ESCAPE || e.key.key == SDLK_SPACE) done = true;
+                break;
+            case SDL_EVENT_GAMEPAD_ADDED: SDL_OpenGamepad(e.gdevice.which); break;
+            }
+        } while (SDL_PollEvent(&e));
+    }
+    SDL_DestroyRenderer(r);
+    SDL_DestroyWindow(w);
+    return true;
+}
+
+// An error box that never hangs. Before the game's window: error_window. After it (a crash in play): SDL's message box,
+// which tries zenity first and waits for it to end - and zenity can hang without ever showing a window (seen on
+// SteamOS's desktop). With zenity out of PATH, SDL draws its own X11 box; only if that fails in a Wayland session (no
+// Xwayland) is zenity tried. Only called just before the process ends, so the changed PATH doesn't matter.
+void plat_error_box(const char *text) {
+    int windows = 0;
+    SDL_Window **list = SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetWindows(&windows) : NULL;
+    SDL_free(list);
+    if (!windows && error_window(text)) return;
+    const char *path = getenv("PATH");
+    char *saved = path ? strdup(path) : NULL;
+    setenv("PATH", "", 1);
+    bool shown = SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, RT_APP_NAME, text, NULL);
+    if (saved) setenv("PATH", saved, 1);
+    free(saved);
+    if (!shown && getenv("WAYLAND_DISPLAY"))  // (no display at all: zenity would hang too)
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, RT_APP_NAME, text, NULL);
+}
+
+// Fatal error (rt_fatal_trace): the last FATAL / exception line of the log in a message box (as on Windows)
 void plat_fatal_notice(void) {
     if (!g_log_path[0]) return;
     fflush(stderr);
-    char text[1600];
-    snprintf(text, sizeof text, "Super Odyssey PC Recomp stopped because of an error.%s\n\nDetails: %s",
-             mods_applied() ? "\n\nMods are on. If this started with a new mod, move it out of the mods folder: mods made "
-                              "for a later version of the game (1.3.0) can crash 1.0.0." : "", g_log_path);
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Super Odyssey PC Recomp", text, NULL);
+    char text[2900] = "Super Odyssey PC Recomp stopped because of an error.";
+    FILE *f = fopen(g_log_path, "rb");
+    if (f) {
+        static char tail[16384];
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f), from = sz > (long)sizeof tail - 1 ? sz - (long)sizeof tail + 1 : 0;
+        fseek(f, from, SEEK_SET);
+        size_t got = fread(tail, 1, sizeof tail - 1, f);
+        tail[got] = 0;
+        fclose(f);
+        char *line = NULL;
+        for (char *p = tail; (p = strstr(p, "FATAL: ")) != NULL; p++) line = p;
+        if (!line) for (char *p = tail; (p = strstr(p, "*** ")) != NULL; p++) line = p;
+        if (line) {
+            char *end = strchr(line, '\n');
+            if (end) *end = 0;
+            snprintf(text, sizeof text, "Super Odyssey PC Recomp stopped because of an error:\n\n%.600s", line);
+            // (VK_ERROR_OUT_OF_HOST_MEMORY -1 / VK_ERROR_OUT_OF_DEVICE_MEMORY -2: not a driver that is too old)
+            if (strstr(line, "failed: -2 (") || strstr(line, "failed: -1 (")) {
+                size_t l = strlen(text);
+                snprintf(text + l, sizeof text - l, "\n\nThe graphics card ran out of memory. Lower the internal resolution "
+                         "(menu > Graphics), or delete powermoon.ini in the game's folder to go back to the default settings.");
+            } else if (strstr(line, "Vulkan") || strstr(line, "VK_") || strstr(line, "vk")) {
+                size_t l = strlen(text);
+                snprintf(text + l, sizeof text - l, "\n\nSuper Odyssey PC Recomp needs a graphics driver with Vulkan 1.3: "
+                         "install your distribution's Mesa or NVIDIA driver (on a Steam Deck it is already there).");
+            }
+        }
+    }
+    size_t l = strlen(text);
+    if (mods_applied())
+        l += (size_t)snprintf(text + l, sizeof text - l, "\n\nMods are on. If this started with a new mod, move it out of "
+                              "the mods folder: mods made for a later version of the game (1.3.0) can crash 1.0.0.");
+    // The crash report (runtime/diagnostics.c) is saved before the box shows. Not diagnostics_fatal_dialog here: its
+    // SDL message box with buttons goes through zenity, which can hang without a window (plat_error_box).
+    char report[1200];
+    if (diagnostics_capture_crash(report, sizeof report))
+        snprintf(text + l, sizeof text - l, "\n\nCrash report (attach it to a bug report): %s", report);
+    else snprintf(text + l, sizeof text - l, "\n\nDetails: %s", g_log_path);
+    plat_error_box(text);
 }
 
 const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);  // runtime/dispatch.c

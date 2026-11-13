@@ -39,15 +39,16 @@ U=$APPDIR/usr/bin
 cp "$B/SuperOdysseyRecomp" "$U/"
 llvm-strip --strip-debug "$U/SuperOdysseyRecomp"  # (symbols stay: crash backtraces name functions)
 cp docs/icon/icon_512.png "$U/icon.png"
-cp third_party/imgui/misc/fonts/Roboto-Medium.ttf runtime/nvn/vulkan/known_programs.txt README.md LICENSE "$U/"
+cp third_party/imgui/misc/fonts/Roboto-Medium.ttf runtime/nvn/vulkan/known_programs.txt data/pipeline-seed.bin README.md \
+   LICENSE "$U/"
 [ -d "$L/helper/odysseygen" ] || { echo "no game code generator helper: tools/linux/gen_helper.sh $ARCH first"; exit 1; }
 cp -R "$L/helper/odysseygen" build/zig "$U/"
 mkdir "$U/gamelib-src"
 cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
    "$U/gamelib-src/"
 cp tools/linux/AppRun "$APPDIR/" && chmod +x "$APPDIR/AppRun"
-cp tools/linux/powermoonrecomp.desktop "$APPDIR/"
-cp docs/icon/icon_512.png "$APPDIR/powermoonrecomp.png" && ln -sf powermoonrecomp.png "$APPDIR/.DirIcon"
+cp tools/linux/superodysseyrecomp.desktop "$APPDIR/"
+cp docs/icon/icon_512.png "$APPDIR/superodysseyrecomp.png" && ln -sf superodysseyrecomp.png "$APPDIR/.DirIcon"
 
 # licences of what ships (the sources' own texts), as in the Windows release
 D=$U/licenses

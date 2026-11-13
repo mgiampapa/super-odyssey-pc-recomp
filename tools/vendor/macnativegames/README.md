@@ -13,6 +13,5 @@ Copies from https://github.com/ly05010419/MacNativeGames at `b75be8cfa704df3701e
 The one change: `extract_exefs.py` checks Super Mario Odyssey's title IDs (base `0100000000010000`, update
 `0100000000010800`) instead of Tears of the Kingdom's.
 
-They're the reference for `runtime/nxpkg.c` (a C port the installer uses) and a way to check it: run them with
-`--keys <prod.keys>` on a game file and compare their output with `build/tests/test_nxpkg.exe`'s
-(`tools/test_nxpkg.c`).
+They're kept as the reference `runtime/nxpkg.c` was ported from, and to compare its output with
+`build/tests/test_nxpkg.exe`'s (`tools/test_nxpkg.c`) during development.

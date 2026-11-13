@@ -13,7 +13,7 @@ uint64_t g_native_window;
 static pthread_mutex_t vsync_lock = PTHREAD_MUTEX_INITIALIZER;  // (host waiters: vi_wait_vsync)
 static pthread_cond_t vsync_cond = PTHREAD_COND_INITIALIZER;
 static uint64_t vsync_period_ns(void) {
-    return odyssey_native_120_enabled() ? 8333333ull : 16666667ull;
+    return 1000000000ull / (uint64_t)odyssey_native_hz();
 }
 static uint64_t base_ns, base_count;  // (vsync_lock) vsync number base_count + k is due at base_ns + k periods
 
@@ -26,7 +26,7 @@ static void *vsync_thread(void *arg) {
     base_ns = next, base_count = g_vsync_count;
     pthread_mutex_unlock(&vsync_lock);
     for (;;) {
-        uint64_t want = vsync_period_ns();  // (the menu's Frame rate: 120 or 60 Hz, changed while the game runs)
+        uint64_t want = vsync_period_ns();  // (the menu's Frame rate: 60, 90 or 120 Hz, changed while the game runs)
         if (want != period) {
             period = want;
             pthread_mutex_lock(&vsync_lock);

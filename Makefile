@@ -45,7 +45,7 @@ GEN_OBJ  := $(patsubst %.c,$(B)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(B)/
 GEN_MODS := $(foreach m,main subsdk0 sdk,$(if $(wildcard $(GEN)/$(m)/*.c),$(m)))
 RT_SRC   := $(wildcard runtime/*.c) $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
             $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
-RT_HDRS  := $(wildcard runtime/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
+RT_HDRS  := $(wildcard runtime/*.h) $(wildcard runtime/hle/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
             $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(wildcard runtime/ui/*.h)
 UI_SRC   := $(wildcard runtime/ui/*.mm)
 UI_OBJ   := $(patsubst runtime/%.mm,$(B)/rt/%.o,$(UI_SRC))
@@ -150,6 +150,9 @@ $(B)/inc/smaa_hlsl.inc: third_party/smaa/SMAA.hlsl
 	LC_ALL=C tr -d '\r' < $< | LC_ALL=C tr '\200-\377' '?' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' > $@
 $(B)/rt/nvn/smaa_data.o: $(B)/inc/smaa_hlsl.inc
 $(B)/rt/nvn/smaa_data.o: RTFLAGS += -I$(B)/inc -Ithird_party/smaa/Textures
+$(B)/rt/nvn/vulkan/fsr3_sdk.o: $(wildcard third_party/fsr3_sdk/api/include/*.h) \
+    $(wildcard third_party/fsr3_sdk/api/include/vk/*.h) $(wildcard third_party/fsr3_sdk/upscalers/include/*.h)
+$(B)/rt/nvn/vulkan/xess_sdk.o: $(wildcard third_party/xess/include/*.h)
 
 $(B)/rt/%.o: runtime/%.cpp $(RT_HDRS)
 	@mkdir -p $(dir $@)
